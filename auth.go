@@ -244,9 +244,10 @@ func (c *Client) Login() error {
 	c.KeepUrl = loginResponseXML.KeepURL
 	c.TermUrl = loginResponseXML.TermURL
 
+	// keepRetry 解析失败时使用默认 60 秒，避免登录已成功却整体判定失败
 	keepRetrySec, err := strconv.Atoi(loginResponseXML.KeepRetry)
-	if err != nil {
-		return err
+	if err != nil || keepRetrySec <= 0 {
+		keepRetrySec = 60
 	}
 
 	c.heartBeatTicker.Reset(time.Second * time.Duration(keepRetrySec))

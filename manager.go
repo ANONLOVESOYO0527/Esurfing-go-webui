@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -33,11 +35,65 @@ type ManagedClient struct {
 	LastLogin     string `json:"last_login"`
 	ErrorCount    int    `json:"error_count"`
 	Order         int    `json:"order"`
+	HasPassword   bool   `json:"has_password"` // 仅响应用：表示是否已设置密码
 
 	client *Client
 	ctx    context.Context
 	cancel context.CancelFunc
 	mu     sync.RWMutex
+}
+
+// InterfaceView 接口对外展示视图（不含锁，避免拷贝锁警告）
+type InterfaceView struct {
+	Name          string `json:"interface"`
+	Enabled       bool   `json:"enabled"`
+	Status        string `json:"status"`
+	Username      string `json:"username"`
+	CheckInterval int    `json:"check_interval"`
+	RetryInterval int    `json:"retry_interval"`
+	DnsAddress    string `json:"dns_address"`
+	BindInterface string `json:"bind_interface"`
+	MaxRetries    int    `json:"max_retries"`
+	UserIP        string `json:"user_ip"`
+	LastHeartbeat string `json:"last_heartbeat"`
+	NextHeartbeat string `json:"next_heartbeat"`
+	LastLogin     string `json:"last_login"`
+	ErrorCount    int    `json:"error_count"`
+	Order         int    `json:"order"`
+	HasPassword   bool   `json:"has_password"`
+}
+
+// validInterfaceName 校验接口名是否合法，防止路径遍历。
+// 允许 Unicode 字母/数字/下划线/短横线/点（含中文等），
+// 禁止：空、过长、路径分隔符（/ \）、点开头（防止 .. 穿越）、控制字符、空白。
+func validInterfaceName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	// 显式拒绝路径分隔符与空字符（filepath.Base 之外的二次保险）
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return false
+	}
+	for _, r := range name {
+		// 拒绝控制字符与所有 Unicode 空白（含普通空格、制表符等）
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return false
+		}
+		// 拒绝 Windows 非法文件名字符，避免 session 文件写入失败
+		switch r {
+		case '<', '>', ':', '"', '|', '?', '*':
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeName 将接口名规整为安全的文件名片段，防止路径遍历
+func sanitizeName(name string) string {
+	return filepath.Base(name)
 }
 
 // stopClient 安全停止客户端（统一停止路径）
@@ -100,25 +156,26 @@ func (m *Manager) getAuthCooldown() time.Duration {
 	return time.Duration(cd) * time.Second
 }
 
-// waitAuthCooldown 等待认证冷却，持锁计算后释放锁再 sleep，避免长阻塞
+// waitAuthCooldown 等待认证冷却，采用"预约占位"模式避免竞态:
+// 进入时立刻把 lastAuthTime 预约到 now+wait，后续并发者基于该未来时间排队，
+// 保证任意两次真实认证之间间隔不小于 cd
 func (m *Manager) waitAuthCooldown(name string) {
 	m.authMu.Lock()
 	cd := m.getAuthCooldown()
-	elapsed := time.Since(m.lastAuthTime)
-	if elapsed >= cd {
-		m.lastAuthTime = time.Now()
-		m.authMu.Unlock()
-		return
+	now := time.Now()
+	next := m.lastAuthTime
+	if now.After(next) {
+		next = now
 	}
-	wait := cd - elapsed
-	m.logHub.Add("info", fmt.Sprintf("[%s] auth cooldown, waiting %v", name, wait.Round(time.Millisecond)))
+	wait := next.Sub(now)
+	// 预约本次认证的槽位
+	m.lastAuthTime = next.Add(cd)
 	m.authMu.Unlock()
 
-	time.Sleep(wait)
-
-	m.authMu.Lock()
-	m.lastAuthTime = time.Now()
-	m.authMu.Unlock()
+	if wait > 0 {
+		m.logHub.Add("info", fmt.Sprintf("[%s] auth cooldown, waiting %v", name, wait.Round(time.Millisecond)))
+		time.Sleep(wait)
+	}
 }
 
 // Load 从配置文件加载客户端列表和全局设置
@@ -150,6 +207,9 @@ func (m *Manager) Load() error {
 
 	for i := range mc.Interfaces {
 		iface := &mc.Interfaces[i]
+		if !validInterfaceName(iface.Name) {
+			return fmt.Errorf("invalid interface name at index %d: %q", i, iface.Name)
+		}
 		iface.Status = "disabled"
 		iface.UserIP = ""
 		iface.LastHeartbeat = ""
@@ -161,13 +221,16 @@ func (m *Manager) Load() error {
 		if iface.Order == 0 {
 			iface.Order = i + 1
 		}
+		if _, dup := m.clients[iface.Name]; dup {
+			return fmt.Errorf("duplicate interface name in config: %s", iface.Name)
+		}
 		m.clients[iface.Name] = iface
 	}
 
 	return nil
 }
 
-// Save 保存当前配置到文件
+// Save 保存当前配置到文件（原子写入，避免写入中断导致配置损坏）
 func (m *Manager) Save() error {
 	m.mu.RLock()
 	mc := ManagerConfig{
@@ -204,22 +267,52 @@ func (m *Manager) Save() error {
 		return err
 	}
 
-	return os.WriteFile(m.configPath, data, 0644)
+	// 原子写入：先写临时文件，再 rename 替换
+	tmp, err := os.CreateTemp(dir, ".config-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, m.configPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
-// GetAll 获取全部客户端列表
-func (m *Manager) GetAll() []ManagedClient {
+// GetAll 获取全部客户端列表视图（敏感字段密码不下发，用 HasPassword 表示是否已设置）
+func (m *Manager) GetAll() []InterfaceView {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	result := make([]ManagedClient, 0, len(m.clients))
+	result := make([]InterfaceView, 0, len(m.clients))
 	for _, c := range m.clients {
 		c.mu.RLock()
-		mc := ManagedClient{
+		v := InterfaceView{
 			Name:          c.Name,
 			Enabled:       c.Enabled,
 			Status:        c.Status,
 			Username:      c.Username,
-			Password:      c.Password,
 			CheckInterval: c.CheckInterval,
 			RetryInterval: c.RetryInterval,
 			DnsAddress:    c.DnsAddress,
@@ -232,8 +325,11 @@ func (m *Manager) GetAll() []ManagedClient {
 			ErrorCount:    c.ErrorCount,
 			Order:         c.Order,
 		}
+		if c.Password != "" {
+			v.HasPassword = true
+		}
 		c.mu.RUnlock()
-		result = append(result, mc)
+		result = append(result, v)
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Order < result[j].Order
@@ -241,15 +337,18 @@ func (m *Manager) GetAll() []ManagedClient {
 	return result
 }
 
-// Get 根据名称获取客户端
-func (m *Manager) Get(name string) *ManagedClient {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.clients[name]
-}
-
 // Add 添加新客户端配置
 func (m *Manager) Add(mc *ManagedClient) error {
+	if !validInterfaceName(mc.Name) {
+		return fmt.Errorf("invalid interface name: %q", mc.Name)
+	}
+	if mc.CheckInterval < 0 || mc.CheckInterval > 24*3600*1000 {
+		return fmt.Errorf("check_interval out of range (0..%d ms)", 24*3600*1000)
+	}
+	if mc.RetryInterval < -1 || mc.RetryInterval > 24*3600*1000 {
+		return fmt.Errorf("retry_interval out of range (-1..%d ms)", 24*3600*1000)
+	}
+
 	m.mu.Lock()
 	if _, exists := m.clients[mc.Name]; exists {
 		m.mu.Unlock()
@@ -275,6 +374,13 @@ func (m *Manager) Add(mc *ManagedClient) error {
 
 // Update 更新客户端配置，运行中的客户端会自动重启
 func (m *Manager) Update(name string, mc *ManagedClient) error {
+	if mc.CheckInterval < 0 || mc.CheckInterval > 24*3600*1000 {
+		return fmt.Errorf("check_interval out of range (0..%d ms)", 24*3600*1000)
+	}
+	if mc.RetryInterval < -1 || mc.RetryInterval > 24*3600*1000 {
+		return fmt.Errorf("retry_interval out of range (-1..%d ms)", 24*3600*1000)
+	}
+
 	m.mu.Lock()
 	existing, exists := m.clients[name]
 	if !exists {
@@ -289,7 +395,10 @@ func (m *Manager) Update(name string, mc *ManagedClient) error {
 	}
 
 	existing.Username = mc.Username
-	existing.Password = mc.Password
+	// 密码为空时保留原密码（前端编辑时不下发密码，留空表示不改）
+	if mc.Password != "" {
+		existing.Password = mc.Password
+	}
 	existing.CheckInterval = mc.CheckInterval
 	existing.RetryInterval = mc.RetryInterval
 	existing.DnsAddress = mc.DnsAddress
@@ -456,7 +565,20 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 
 	var lastStatus string = "offline"
 
+	// ctxCheck 返回当前 ctx 是否已取消，用于回调中拒绝旧 goroutine 的写入
+	ctxCheck := func() bool {
+		select {
+		case <-mc.ctx.Done():
+			return true
+		default:
+			return false
+		}
+	}
+
 	client.OnStatusChange = func(status string) {
+		if ctxCheck() {
+			return
+		}
 		mc.mu.Lock()
 		mc.Status = status
 		if status == "offline" {
@@ -489,6 +611,9 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 	}
 
 	client.OnAuthSuccess = func(userIP string) {
+		if ctxCheck() {
+			return
+		}
 		mc.mu.Lock()
 		mc.UserIP = userIP
 		mc.LastLogin = time.Now().Format(time.RFC3339)
@@ -497,7 +622,7 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 		mc.mu.Unlock()
 
 		// 保存会话信息，用于意外退出后恢复
-		SaveSession(m.sessionsDir, name, &SessionData{
+		if err := SaveSession(m.sessionsDir, name, &SessionData{
 			ClientID: client.ClientID.String(),
 			Hostname: client.Hostname,
 			Mac:      client.MacAddress,
@@ -508,12 +633,17 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 			KeepUrl:  client.KeepUrl,
 			TermUrl:  client.TermUrl,
 			IndexUrl: client.IndexUrl,
-		})
+		}); err != nil {
+			m.logHub.Add(LevelError, fmt.Sprintf("[%s] save session failed: %v", name, err))
+		}
 
 		m.logHub.Add(LevelOK, fmt.Sprintf("[%s] auth finished, ip: %s", name, userIP))
 	}
 
 	client.OnHeartbeat = func(interval int) {
+		if ctxCheck() {
+			return
+		}
 		mc.mu.Lock()
 		mc.LastHeartbeat = time.Now().Format(time.RFC3339)
 		mc.ErrorCount = 0
@@ -562,6 +692,17 @@ func (m *Manager) GetSettings() Settings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.settings
+}
+
+// GetNames 返回所有接口名称，避免在调用方拷贝含锁的 ManagedClient
+func (m *Manager) GetNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.clients))
+	for name := range m.clients {
+		names = append(names, name)
+	}
+	return names
 }
 
 // UpdateSettings 更新全局设置
@@ -733,9 +874,4 @@ func (m *Manager) sendTermFromSession(sd *SessionData, name string) bool {
 	stateXML, _ := tmpClient.GenerateStateXML()
 	_, err = tmpClient.PostXMLWithTimeout(sd.TermUrl, stateXML)
 	return err == nil
-}
-
-// ClearSession 清除指定客户端的保存会话
-func (m *Manager) ClearSession(name string) {
-	DeleteSession(m.sessionsDir, name)
 }

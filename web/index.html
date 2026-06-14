@@ -393,7 +393,7 @@ body::-webkit-scrollbar{display:none}
           <div class="mb">
             <div class="fg"><label>网卡</label><input :value="editingName" readonly></div>
             <div class="fg"><label>账号</label><input x-model="editForm.username" required></div>
-            <div class="fg"><label>密码</label><input x-model="editForm.password" type="password" required></div>
+            <div class="fg"><label>密码</label><input x-model="editForm.password" type="password" placeholder="留空表示不修改" :required="!find(editingName)?.has_password"></div>
             <div class="r2">
               <div class="fg"><label>检查间隔 ms</label><input x-model.number="editForm.ci" type="number" min="0"></div>
               <div class="fg"><label>重试间隔 ms</label><input x-model.number="editForm.ri" type="number" min="-1"></div>
@@ -451,6 +451,7 @@ function app() {
     logs: [],
     settings: { web_port: 8080, default_max_retries: 5, auth_cooldown: 5, log_level: 'info', access_mode: 'all' },
     evt: null,
+    _sseRetry: 1000,
     busy: {},
     modal: { show: false, type: '', title: '' },
     editingName: '',
@@ -492,14 +493,18 @@ function app() {
       try {
         var r = await fetch('/api/logs').then(r => { if (!r.ok) throw Error(r.status); return r.json(); });
         this.logs = r;
-      } catch (e) {}
+      } catch (e) {
+        this.toast('日志加载失败: ' + e.message);
+      }
     },
 
     async loadSysIfs() {
       try {
         var r = await fetch('/api/system/interfaces').then(r => { if (!r.ok) throw Error(r.status); return r.json(); });
         this.systemInterfaces = r;
-      } catch (e) {}
+      } catch (e) {
+        // 静默失败：调用方有手动输入兜底
+      }
     },
 
     switchTab(t) {
@@ -613,7 +618,8 @@ function app() {
       var f = this.find(name); if (!f) return;
       this.editingName = name;
       this.editForm = {
-        username: f.username || '', password: f.password || '',
+        // 密码不下发到前端，编辑时留空，提交时若为空则后端保留原密码
+        username: f.username || '', password: '',
         ci: f.check_interval || 0, ri: f.retry_interval ?? 0,
         mr: f.max_retries || 0, dns: f.dns_address || ''
       };
@@ -686,11 +692,21 @@ function app() {
 
     connSSE() {
       if (this.evt) return;
+      var delay = this._sseRetry || 1000;
       try {
         this.evt = new EventSource('/api/logs/stream');
+        this.evt.onopen = () => { this._sseRetry = 1000; };
         this.evt.onmessage = (ev) => { try { this.addLog(JSON.parse(ev.data)); } catch (ex) {} };
-        this.evt.onerror = () => { this.evt.close(); this.evt = null; setTimeout(() => this.connSSE(), 3000); };
-      } catch (ex) {}
+        this.evt.onerror = () => {
+          if (this.evt) { this.evt.close(); this.evt = null; }
+          // 指数退避，上限 30 秒
+          this._sseRetry = Math.min((this._sseRetry || 1000) * 2, 30000);
+          setTimeout(() => this.connSSE(), delay);
+        };
+      } catch (ex) {
+        this._sseRetry = Math.min((this._sseRetry || 1000) * 2, 30000);
+        setTimeout(() => this.connSSE(), delay);
+      }
     },
 
     toast(msg) {

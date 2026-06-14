@@ -137,7 +137,7 @@ func NewHttpTransport(c *Config) (http.RoundTripper, error) {
 	if c.BindInterface != "" && c.BindInterface != "sys_default" {
 		ip, err := GetInterfaceIP(c.BindInterface)
 		if err != nil {
-			return nil, errors.New(fmt.Errorf("failed to get interface IP: %w", err).Error())
+			return nil, fmt.Errorf("failed to get interface IP: %w", err)
 		}
 
 		localIP := net.ParseIP(ip)

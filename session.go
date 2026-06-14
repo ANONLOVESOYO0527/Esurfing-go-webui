@@ -23,12 +23,12 @@ type SessionData struct {
 	SavedAt   string `json:"saved_at"`
 }
 
-// sessionPath 返回会话文件路径
+// sessionPath 返回会话文件路径，name 经 filepath.Base 规整防止路径遍历
 func sessionPath(sessionsDir, name string) string {
-	return filepath.Join(sessionsDir, name+".json")
+	return filepath.Join(sessionsDir, filepath.Base(name)+".json")
 }
 
-// SaveSession 保存会话信息到文件
+// SaveSession 保存会话信息到文件（权限 0600，仅属主可读写）
 func SaveSession(sessionsDir, name string, sd *SessionData) error {
 	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
 		return fmt.Errorf("create sessions dir: %w", err)
@@ -38,7 +38,13 @@ func SaveSession(sessionsDir, name string, sd *SessionData) error {
 	if err != nil {
 		return fmt.Errorf("marshal session: %w", err)
 	}
-	return os.WriteFile(sessionPath(sessionsDir, name), data, 0644)
+	path := sessionPath(sessionsDir, name)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	// 显式收紧已有文件权限（WriteFile 对已存在文件不改权限）
+	_ = os.Chmod(path, 0600)
+	return nil
 }
 
 // LoadSession 从文件加载会话信息

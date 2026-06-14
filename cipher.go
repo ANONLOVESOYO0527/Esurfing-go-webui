@@ -90,12 +90,18 @@ func pkcs7Padding(data []byte, blockSize int) []byte {
 
 func pkcs7Unpadding(data []byte, blockSize int) ([]byte, error) {
 	length := len(data)
-	if length == 0 {
+	if length == 0 || length%blockSize != 0 {
 		return nil, ErrInvalidPadding
 	}
 	padding := int(data[length-1])
 	if padding < 1 || padding > blockSize || length < padding {
 		return nil, ErrInvalidPadding
+	}
+	// 严格校验：所有填充字节都必须等于 padding 值
+	for i := length - padding; i < length; i++ {
+		if data[i] != byte(padding) {
+			return nil, ErrInvalidPadding
+		}
 	}
 	return data[:length-padding], nil
 }
@@ -122,6 +128,12 @@ func NewECBDecrypter(b cipher.Block) cipher.BlockMode {
 
 func (x *ecbEncrypter) BlockSize() int { return x.blockSize }
 func (x *ecbEncrypter) CryptBlocks(dst, src []byte) {
+	if len(src)%x.blockSize != 0 {
+		panic("ecbEncrypter: input not full blocks")
+	}
+	if len(dst) < len(src) {
+		panic("ecbEncrypter: output smaller than input")
+	}
 	for i := 0; i < len(src); i += x.blockSize {
 		x.b.Encrypt(dst[i:i+x.blockSize], src[i:i+x.blockSize])
 	}
@@ -129,6 +141,12 @@ func (x *ecbEncrypter) CryptBlocks(dst, src []byte) {
 
 func (x *ecbDecrypter) BlockSize() int { return x.blockSize }
 func (x *ecbDecrypter) CryptBlocks(dst, src []byte) {
+	if len(src)%x.blockSize != 0 {
+		panic("ecbDecrypter: input not full blocks")
+	}
+	if len(dst) < len(src) {
+		panic("ecbDecrypter: output smaller than input")
+	}
 	for i := 0; i < len(src); i += x.blockSize {
 		x.b.Decrypt(dst[i:i+x.blockSize], src[i:i+x.blockSize])
 	}

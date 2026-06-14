@@ -208,7 +208,7 @@ func (c *Client) Logout() {
 	resp, err := c.HttpClient.Do(request)
 	if err == nil && resp != nil {
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusNoContent && c.cipher != nil {
+		if resp.StatusCode == http.StatusNoContent && c.cipher != nil && c.TermUrl != "" {
 			stateXML, _ := c.GenerateStateXML()
 			_, _ = c.PostXMLWithTimeout(c.TermUrl, stateXML)
 			c.logln("info", "log out request sent")
