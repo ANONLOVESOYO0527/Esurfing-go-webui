@@ -70,6 +70,10 @@ func decodeHex(data []byte) ([]byte, error) {
 	return dst[:n], err
 }
 
+// zeroPadding/zeroUnpadding 用于 AES/3DES/XTEA/ZUC 系列——这是协议约定，
+// 必须与服务端实现一致，不能改用 PKCS7（否则认证报文无法被服务器解密）。
+// 已知局限：zeroUnpadding 会移除明文末尾所有 \x00，若明文本身以 NUL 结尾会被误截断；
+// 本协议传输的 XML 文本不含 NUL，故实际无影响。
 func zeroPadding(data []byte, blockSize int) []byte {
 	padding := (blockSize - len(data)%blockSize) % blockSize
 	if padding == 0 {

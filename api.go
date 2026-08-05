@@ -305,10 +305,13 @@ func (a *API) handleSystemInterfaces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	managed := a.manager.GetNames()
+	all := a.manager.GetAll()
 	existing := make(map[string]bool)
-	for _, m := range managed {
-		existing[m] = true
+	for _, c := range all {
+		existing[c.Name] = true
+		if c.BindInterface != "" {
+			existing[c.BindInterface] = true
+		}
 	}
 
 	ifaces, err := ListInterfaces()

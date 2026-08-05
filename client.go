@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,6 +52,7 @@ type Client struct {
 	OnBeforeAuth   func()
 	OnLog          func(level, msg string)
 
+	authed       atomic.Bool // 认证成功后置位；Logout 据此决定是否发送 term
 	lastAuthFail time.Time
 }
 
@@ -67,6 +69,9 @@ func (c *Client) logln(level, msg string) {
 		c.OnLog(level, msg)
 	}
 }
+
+// RetryIntervalNever 表示不自动重试认证（约定值，任意负数等效）
+const RetryIntervalNever = -1
 
 // NewClient 创建认证客户端，使用外部提供的 ctx/cancel
 func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (*Client, error) {
@@ -88,6 +93,8 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 		config.CheckInterval = 10000
 	}
 	if config.RetryInterval < 0 {
+		// 负值（约定为 RetryIntervalNever）表示不重试：用 MaxInt32 ms（≈24 天）
+		// 实际禁用重试，且不会让 time.Duration 乘法溢出
 		config.RetryInterval = math.MaxInt32
 	}
 	if config.RetryInterval == 0 {
@@ -192,31 +199,27 @@ func (c *Client) SendHeartbeat() error {
 	return nil
 }
 
-// Logout 注销并断开连接
+// Logout 在客户端停止时向服务器发送下线请求，清理服务器侧会话。
+// 由 Start 的 defer 调用；此时 ctx 通常已取消，故使用带独立超时的 PostXMLWithTimeout
+// （它内部创建临时 context，不受 c.Ctx 取消影响）。
+// 仅在本次曾认证成功（authed）时发送，避免对未认证 client 发无意义请求。
 func (c *Client) Logout() {
-	// 如果是被主动 stop（ctx 已取消），不触发 offline 回调，避免覆盖新 client 状态
-	if c.Ctx.Err() != nil {
+	if !c.authed.Load() {
 		return
 	}
-	request, err := c.NewGetRequest("http://connect.rom.miui.com/generate_204")
+	if c.cipher == nil || c.TermUrl == "" {
+		return
+	}
+	stateXML, err := c.GenerateStateXML()
 	if err != nil {
-		if c.OnStatusChange != nil {
-			c.OnStatusChange("offline")
-		}
+		c.logf("warn", "logout: build state xml failed: %v", err)
 		return
 	}
-	resp, err := c.HttpClient.Do(request)
-	if err == nil && resp != nil {
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusNoContent && c.cipher != nil && c.TermUrl != "" {
-			stateXML, _ := c.GenerateStateXML()
-			_, _ = c.PostXMLWithTimeout(c.TermUrl, stateXML)
-			c.logln("info", "log out request sent")
-		}
+	if _, err := c.PostXMLWithTimeout(c.TermUrl, stateXML); err != nil {
+		c.logf("warn", "logout: send term failed: %v", err)
+		return
 	}
-	if c.OnStatusChange != nil {
-		c.OnStatusChange("offline")
-	}
+	c.logln("info", "log out request sent")
 }
 
 // CheckNetwork 检测网络状态，未认证时自动触发认证流程
@@ -316,6 +319,7 @@ func (c *Client) TryResume(sd *SessionData) bool {
 		return false
 	}
 
+	c.authed.Store(true)
 	c.logln("ok", "session resumed successfully")
 	if c.OnStatusChange != nil {
 		c.OnStatusChange("online")

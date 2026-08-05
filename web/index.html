@@ -509,6 +509,12 @@ function app() {
 
     switchTab(t) {
       if (t === this.tab) return;
+      // 离开日志页时关闭 SSE，避免长连接空跑与日志数组持续增长
+      if (this.tab === 'more' && this.evt) {
+        this.evt.close();
+        this.evt = null;
+        this._sseRetry = 1000;
+      }
       this.tab = t;
       if (t === 'more') {
         this.loadLogs().then(() => {
@@ -678,7 +684,10 @@ function app() {
     addLog(l) {
       this.logs.push(l);
       if (this.logs.length > 1000) this.logs.shift();
-      this.$nextTick(() => this.scrollLogBottom());
+      // 仅在日志页可见时触发 DOM 滚动，避免后台 tab 无谓重排
+      if (this.tab === 'more') {
+        this.$nextTick(() => this.scrollLogBottom());
+      }
     },
 
     scrollLogBottom() {
@@ -692,7 +701,6 @@ function app() {
 
     connSSE() {
       if (this.evt) return;
-      var delay = this._sseRetry || 1000;
       try {
         this.evt = new EventSource('/api/logs/stream');
         this.evt.onopen = () => { this._sseRetry = 1000; };
@@ -701,11 +709,11 @@ function app() {
           if (this.evt) { this.evt.close(); this.evt = null; }
           // 指数退避，上限 30 秒
           this._sseRetry = Math.min((this._sseRetry || 1000) * 2, 30000);
-          setTimeout(() => this.connSSE(), delay);
+          setTimeout(() => this.connSSE(), this._sseRetry);
         };
       } catch (ex) {
         this._sseRetry = Math.min((this._sseRetry || 1000) * 2, 30000);
-        setTimeout(() => this.connSSE(), delay);
+        setTimeout(() => this.connSSE(), this._sseRetry);
       }
     },
 

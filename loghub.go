@@ -138,7 +138,10 @@ func (h *LogHub) Add(level, msg string) {
 	}
 	h.entries = append(h.entries, entry)
 	if len(h.entries) > h.maxSize {
-		h.entries = h.entries[len(h.entries)-h.maxSize:]
+		// copy 到新切片，避免 reslice 后旧底层数组前段无法被 GC
+		kept := make([]LogEntry, h.maxSize)
+		copy(kept, h.entries[len(h.entries)-h.maxSize:])
+		h.entries = kept
 	}
 	for ch := range h.subs {
 		select {

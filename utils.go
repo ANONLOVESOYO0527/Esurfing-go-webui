@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -143,16 +144,33 @@ func NewHttpTransport(c *Config) (http.RoundTripper, error) {
 		localIP := net.ParseIP(ip)
 		ifName := c.BindInterface
 		resolver := GetResolver(c, localIP)
+
+		// 接口 IP 缓存：DHCP 续约后 IP 可能变化，但不必每次建连都 syscall 查询。
+		// 5 秒 TTL 兼顾新鲜度与性能。
+		var (
+			ipMu      sync.Mutex
+			cachedIP  = localIP
+			ipChecked time.Time
+		)
+		freshIP := func() net.IP {
+			ipMu.Lock()
+			defer ipMu.Unlock()
+			if time.Since(ipChecked) < 5*time.Second {
+				return cachedIP
+			}
+			if s, err := GetInterfaceIP(ifName); err == nil {
+				if p := net.ParseIP(s); p != nil {
+					cachedIP = p
+				}
+			}
+			ipChecked = time.Now()
+			return cachedIP
+		}
+
 		return &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				curIP := localIP
-				if freshIP, err := GetInterfaceIP(ifName); err == nil {
-					if parsed := net.ParseIP(freshIP); parsed != nil {
-						curIP = parsed
-					}
-				}
 				d := net.Dialer{
-					LocalAddr: &net.TCPAddr{IP: curIP},
+					LocalAddr: &net.TCPAddr{IP: freshIP()},
 					Timeout:   10 * time.Second,
 					Resolver:  resolver,
 				}

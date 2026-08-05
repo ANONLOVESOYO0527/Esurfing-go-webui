@@ -61,6 +61,7 @@ func (c *Client) Auth(URL string) error {
 		return err
 	}
 
+	c.authed.Store(true)
 	return nil
 }
 
@@ -104,7 +105,7 @@ func (c *Client) GetEConfig() error {
 		_ = Body.Close()
 	}(response.Body)
 
-	data, err := io.ReadAll(response.Body)
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
 	if err != nil {
 		return err
 	}
@@ -187,7 +188,7 @@ func (c *Client) GetAlgoId() error {
 		_ = Body.Close()
 	}(response.Body)
 
-	algoIdData, err := io.ReadAll(response.Body)
+	algoIdData, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
 	if err != nil {
 		return err
 	}

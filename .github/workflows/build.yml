@@ -148,7 +148,7 @@ jobs:
 
           printf 'Package: esurfing-go-webui\nVersion: %s\nSection: net\nPriority: optional\nArchitecture: %s\nMaintainer: DreamwareN\nDescription: Esurfing campus network authentication client with web UI\n' "${VERSION}" "${ARCH}" > "${PKG_DIR}/DEBIAN/control"
 
-          printf '#!/bin/sh\nset -e\nif [ -d /run/systemd/system ]; then\n  systemctl daemon-reload\n  systemctl enable esurfing-go-webui.service\n  systemctl start esurfing-go-webui.service || true\nfi\n' > "${PKG_DIR}/DEBIAN/postinst"
+          printf '#!/bin/sh\nset -e\nif ! id esurfing >/dev/null 2>&1; then\n  useradd --system --no-create-home --shell /usr/sbin/nologin esurfing\nfi\nmkdir -p /var/lib/esurfing-webui\nchown -R esurfing:esurfing /var/lib/esurfing-webui\nmkdir -p /etc/esurfing-webui\nchown esurfing:esurfing /etc/esurfing-webui\nif [ -f /etc/esurfing-webui/config.json ]; then\n  chown esurfing:esurfing /etc/esurfing-webui/config.json\nfi\nif [ -d /run/systemd/system ]; then\n  systemctl daemon-reload\n  systemctl enable esurfing-go-webui.service\n  systemctl start esurfing-go-webui.service || true\nfi\n' > "${PKG_DIR}/DEBIAN/postinst"
           chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 
           printf '#!/bin/sh\nset -e\nif [ -d /run/systemd/system ]; then\n  systemctl stop esurfing-go-webui.service || true\n  systemctl disable esurfing-go-webui.service || true\nfi\n' > "${PKG_DIR}/DEBIAN/prerm"

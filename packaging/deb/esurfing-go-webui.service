@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=esurfing
+Group=esurfing
 ExecStart=/usr/bin/esurfing-go-webui -c /etc/esurfing-webui/config.json
 WorkingDirectory=/var/lib/esurfing-webui
 Restart=on-failure

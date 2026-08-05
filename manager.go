@@ -96,7 +96,10 @@ func sanitizeName(name string) string {
 	return filepath.Base(name)
 }
 
-// stopClient 安全停止客户端（统一停止路径）
+// stopClient 安全停止客户端（统一停止路径）。
+// 仅 cancel ctx 并置 nil，不等待 goroutine 退出：Start 的 defer Logout 会异步发送 term。
+// term 请求携带本次认证的 ClientID/Ticket（每次认证都新生成），服务器能据此区分会话，
+// 故异步发出的旧 term 不会误下线新会话。进程退出时由 Manager.wg.Wait() 等待全部 goroutine 退出。
 func (mc *ManagedClient) stopClient() {
 	if mc.client != nil {
 		mc.client.Cancel()
@@ -130,6 +133,9 @@ type Manager struct {
 
 	authMu       sync.Mutex   // 全局认证互斥锁
 	lastAuthTime time.Time    // 上次认证完成时间
+
+	saveMu sync.Mutex       // 串行化配置文件写入，避免并发 Save 丢更新
+	wg     sync.WaitGroup   // 跟踪所有 client goroutine，用于优雅退出时等待 term 发送
 }
 
 // NewManager 创建管理器实例
@@ -210,6 +216,25 @@ func (m *Manager) Load() error {
 		if !validInterfaceName(iface.Name) {
 			return fmt.Errorf("invalid interface name at index %d: %q", i, iface.Name)
 		}
+		// 校验/钳制数值字段，防止手改配置导致 NewTicker 溢出 panic
+		if iface.CheckInterval < 0 {
+			iface.CheckInterval = 0
+		}
+		if iface.CheckInterval > 24*3600*1000 {
+			iface.CheckInterval = 24 * 3600 * 1000
+		}
+		if iface.RetryInterval < -1 {
+			iface.RetryInterval = -1
+		}
+		if iface.RetryInterval > 24*3600*1000 {
+			iface.RetryInterval = 24 * 3600 * 1000
+		}
+		if iface.MaxRetries < 0 {
+			iface.MaxRetries = 0
+		}
+		if iface.BindInterface != "" && !validInterfaceName(iface.BindInterface) {
+			return fmt.Errorf("invalid bind_interface name at index %d: %q", i, iface.BindInterface)
+		}
 		iface.Status = "disabled"
 		iface.UserIP = ""
 		iface.LastHeartbeat = ""
@@ -230,8 +255,12 @@ func (m *Manager) Load() error {
 	return nil
 }
 
-// Save 保存当前配置到文件（原子写入，避免写入中断导致配置损坏）
+// Save 保存当前配置到文件（原子写入，避免写入中断导致配置损坏）。
+// saveMu 串行化整个"读内存+写文件"过程，避免并发 Save 各自基于旧快照写入导致丢更新。
 func (m *Manager) Save() error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
 	m.mu.RLock()
 	mc := ManagerConfig{
 		Settings: m.settings,
@@ -342,6 +371,9 @@ func (m *Manager) Add(mc *ManagedClient) error {
 	if !validInterfaceName(mc.Name) {
 		return fmt.Errorf("invalid interface name: %q", mc.Name)
 	}
+	if mc.BindInterface != "" && !validInterfaceName(mc.BindInterface) {
+		return fmt.Errorf("invalid bind_interface name: %q", mc.BindInterface)
+	}
 	if mc.CheckInterval < 0 || mc.CheckInterval > 24*3600*1000 {
 		return fmt.Errorf("check_interval out of range (0..%d ms)", 24*3600*1000)
 	}
@@ -374,6 +406,9 @@ func (m *Manager) Add(mc *ManagedClient) error {
 
 // Update 更新客户端配置，运行中的客户端会自动重启
 func (m *Manager) Update(name string, mc *ManagedClient) error {
+	if mc.BindInterface != "" && !validInterfaceName(mc.BindInterface) {
+		return fmt.Errorf("invalid bind_interface name: %q", mc.BindInterface)
+	}
 	if mc.CheckInterval < 0 || mc.CheckInterval > 24*3600*1000 {
 		return fmt.Errorf("check_interval out of range (0..%d ms)", 24*3600*1000)
 	}
@@ -550,9 +585,14 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 
 	name := mc.Name
 	mc.ctx, mc.cancel = context.WithCancel(context.Background())
+	// 捕获本次 ctx 到局部变量，供回调闭包判断过期。
+	// 不能读 mc.ctx：startClient 重入会覆盖 mc.ctx 指向新 ctx，导致旧 goroutine
+	// 的 ctxCheck 误判为"未取消"而继续写状态，污染新 client。
+	ctx := mc.ctx
 
 	client, err := NewClient(cfg, mc.ctx, mc.cancel)
 	if err != nil {
+		mc.cancel() // 避免 ctx 泄漏
 		mc.mu.Unlock()
 		return err
 	}
@@ -565,10 +605,10 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 
 	var lastStatus string = "offline"
 
-	// ctxCheck 返回当前 ctx 是否已取消，用于回调中拒绝旧 goroutine 的写入
+	// ctxCheck 返回本次 ctx 是否已取消，用于回调中拒绝旧 goroutine 的写入
 	ctxCheck := func() bool {
 		select {
-		case <-mc.ctx.Done():
+		case <-ctx.Done():
 			return true
 		default:
 			return false
@@ -660,13 +700,15 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 	mc.Status = "offline"
 	mc.mu.Unlock()
 
+	m.wg.Add(1)
 	go func() {
+		defer m.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				m.logHub.Add(LevelError, fmt.Sprintf("[%s] panic: %v", name, r))
 				mc.mu.Lock()
+				mc.stopClient()
 				mc.Status = "offline"
-				mc.client = nil
 				mc.mu.Unlock()
 			}
 		}()
@@ -692,17 +734,6 @@ func (m *Manager) GetSettings() Settings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.settings
-}
-
-// GetNames 返回所有接口名称，避免在调用方拷贝含锁的 ManagedClient
-func (m *Manager) GetNames() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	names := make([]string, 0, len(m.clients))
-	for name := range m.clients {
-		names = append(names, name)
-	}
-	return names
 }
 
 // UpdateSettings 更新全局设置
@@ -780,7 +811,13 @@ func (m *Manager) StopAll() {
 		mc.mu.Unlock()
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	// 等待所有 client goroutine 退出（含 Logout defer 发送 term），最多 5 秒
+	done := make(chan struct{})
+	go func() { m.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 // ForceLogout 强制断开指定客户端：向服务器发送 term 请求后清除状态
@@ -792,37 +829,34 @@ func (m *Manager) ForceLogout(name string) error {
 		return fmt.Errorf("interface %s not found", name)
 	}
 
-	// 优先从运行中的 client 取会话信息发送 term
-	mc.mu.RLock()
-	c := mc.client
-	mc.mu.RUnlock()
+	// 停止运行中的 client。若已认证，Start 的 defer Logout 会发送 term；
+	// 不直接读 client 字段（cipher/TermUrl 等），避免与 client goroutine 竞争。
+	// 未认证或 client 未运行时，用保存的 session 兜底发 term。
+	mc.mu.Lock()
+	authed := mc.client != nil && mc.client.authed.Load()
+	if mc.client != nil {
+		mc.stopClient()
+	}
+	mc.mu.Unlock()
 
-	if c != nil {
-		// 用运行中的 client 直接发 term
-		if c.cipher != nil && c.TermUrl != "" {
-			stateXML, _ := c.GenerateStateXML()
-			if _, err := c.PostXMLWithTimeout(c.TermUrl, stateXML); err != nil {
-				m.logHub.Add("info", fmt.Sprintf("[%s] force logout term send failed: %v", name, err))
-			} else {
-				m.logHub.Add("info", fmt.Sprintf("[%s] force logout term sent", name))
-			}
-		}
-	} else {
-		// client 已停止，用保存的会话临时构造一个 client 来发 term
+	if !authed {
 		if sd, err := LoadSession(m.sessionsDir, name); err == nil {
 			if m.sendTermFromSession(sd, name) {
 				m.logHub.Add("info", fmt.Sprintf("[%s] force logout term sent (from session)", name))
 			}
 		}
+	} else {
+		// term 由 Start 的 defer Logout 异步发送（带旧 ClientID/Ticket，不影响后续新会话）
+		m.logHub.Add("info", fmt.Sprintf("[%s] force logout, term sending in background", name))
 	}
 
 	DeleteSession(m.sessionsDir, name)
 
 	mc.mu.Lock()
-	mc.stopClient()
 	mc.Status = "offline"
 	mc.UserIP = ""
 	mc.LastHeartbeat = ""
+	mc.NextHeartbeat = ""
 	mc.ErrorCount = 0
 	mc.mu.Unlock()
 

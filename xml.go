@@ -13,6 +13,9 @@ const (
 	UserAgentAndroid = "CCTP/android64_vpn/2093"
 )
 
+// maxHTTPBody 限制 HTTP 响应体读取上限（10MB），防止异常/恶意大响应耗尽内存
+const maxHTTPBody = 10 << 20
+
 // TicketRequest 获取票据的请求体
 type TicketRequest struct {
 	XMLName   xml.Name `xml:"request"`
@@ -175,7 +178,7 @@ func (c *Client) PostXML(url string, data []byte) ([]byte, error) {
 		_ = Body.Close()
 	}(response.Body)
 
-	data, err = io.ReadAll(response.Body)
+	data, err = io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +212,7 @@ func (c *Client) PostXMLWithTimeout(url string, data []byte) ([]byte, error) {
 		_ = Body.Close()
 	}(response.Body)
 
-	data, err = io.ReadAll(response.Body)
+	data, err = io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
 	if err != nil {
 		return nil, err
 	}
