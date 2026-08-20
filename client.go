@@ -54,6 +54,12 @@ type Client struct {
 
 	authed       atomic.Bool // 认证成功后置位；Logout 据此决定是否发送 term
 	lastAuthFail time.Time
+
+	// consecutiveCheckFailures 连续网络检查异常计数（请求失败或非 204/302 状态码）。
+	// 达到 blackholeReauthThreshold 后主动发起重认证，突破“只有 302 才重新认证”
+	// 的单一恢复路径：多 WAN 负载均衡下报文选路不对称、上游 uRPF 丢弃等场景
+	// 会造成黑洞（无响应、无重定向），旧逻辑此时会永久卡死。
+	consecutiveCheckFailures int
 }
 
 func (c *Client) logf(level, format string, v ...interface{}) {
@@ -72,6 +78,10 @@ func (c *Client) logln(level, msg string) {
 
 // RetryIntervalNever 表示不自动重试认证（约定值，任意负数等效）
 const RetryIntervalNever = -1
+
+// blackholeReauthThreshold 连续网络检查异常达到此次数后触发主动重认证。
+// 取 3：默认 10s 检查间隔下约 30s 判定网络黑洞，远小于会话超时，误判代价低。
+const blackholeReauthThreshold = 3
 
 // NewClient 创建认证客户端，使用外部提供的 ctx/cancel
 func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (*Client, error) {
@@ -149,17 +159,37 @@ func (c *Client) Start() {
 					continue
 				}
 			}
-			if err := c.CheckNetwork(); err != nil {
-				c.logf("warn", "network check failed: %v", err)
+			checkErr := c.CheckNetwork()
+			if checkErr != nil {
+				c.consecutiveCheckFailures++
+				c.logf("warn", "network check failed (%d consecutive): %v", c.consecutiveCheckFailures, checkErr)
+				// 黑洞自愈：连续多次探测异常（超时/DNS失败/非204状态码）时，
+				// 会话很可能已死且拿不到 302 重定向，主动重新认证。
+				if c.consecutiveCheckFailures >= blackholeReauthThreshold {
+					c.logln("warn", "network unreachable repeatedly, forcing re-auth")
+					c.consecutiveCheckFailures = 0
+					c.HandleRedirect(nil)
+				}
+			} else {
+				c.consecutiveCheckFailures = 0
 			}
 		case <-c.heartBeatTicker.C:
 			err := c.SendHeartbeat()
 			if err != nil {
 				c.logf("warn", "send heartbeat error: %v", err)
-				if err := c.CheckNetwork(); err != nil {
+				c.consecutiveCheckFailures++
+				c.logf("warn", "heartbeat failed (%d consecutive)", c.consecutiveCheckFailures)
+				// 心跳连续失败同样说明会话疑似已死：达到阈值时停发心跳并强制重认证。
+				if c.consecutiveCheckFailures >= blackholeReauthThreshold {
+					c.logln("warn", "heartbeat failed repeatedly, forcing re-auth")
+					c.consecutiveCheckFailures = 0
+					c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
+					c.HandleRedirect(nil)
+				} else if err := c.CheckNetwork(); err != nil {
 					c.logf("warn", "network recheck failed: %v", err)
 				}
 			} else {
+				c.consecutiveCheckFailures = 0
 				c.logln("debug", "send heartbeat")
 				if c.OnStatusChange != nil {
 					c.OnStatusChange("online")
@@ -244,12 +274,14 @@ func (c *Client) CheckNetwork() error {
 
 	switch resp.StatusCode {
 	case http.StatusNoContent:
+		c.consecutiveCheckFailures = 0
 		if c.OnStatusChange != nil {
 			c.OnStatusChange("online")
 		}
 		return nil
 
 	case http.StatusFound:
+		c.consecutiveCheckFailures = 0
 		c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
 		c.logln("info", "auth required")
 		if c.OnStatusChange != nil {
@@ -258,16 +290,23 @@ func (c *Client) CheckNetwork() error {
 		return c.HandleRedirect(resp)
 
 	default:
-		return errors.New(fmt.Sprintf("unexpected status code: %d", resp.StatusCode))
+		// 非 204/302（如 200 弹窗页、502 网关错误）：视为异常，交给调用方计数
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 }
 
-// HandleRedirect 处理 302 重定向，执行认证
+// HandleRedirect 处理 302 重定向，执行认证。
+// resp 为 nil 时表示“强制重认证”（网络黑洞自愈路径）：不经过重定向探测，
+// 直接从零开始完整认证流程，由服务器报错（missing school info 等）兜底。
 func (c *Client) HandleRedirect(resp *http.Response) error {
 	if c.OnBeforeAuth != nil {
 		c.OnBeforeAuth()
 	}
-	if err := c.Auth(resp.Header.Get("Location")); err != nil {
+	var redirectURL string
+	if resp != nil {
+		redirectURL = resp.Header.Get("Location")
+	}
+	if err := c.Auth(redirectURL); err != nil {
 		c.logf("warn", "auth failed: %v", err)
 		c.lastAuthFail = time.Now()
 		if c.OnStatusChange != nil {

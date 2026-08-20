@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -133,6 +134,17 @@ func FormatEConfig(data []byte) ([]byte, error) {
 	return []byte(str4), nil
 }
 
+// bindToDeviceFunc 返回将 socket 绑定到指定网络设备的 Control 回调（Linux）。
+// 仅绑定源 IP 时，出接口仍由路由表决定：在多 WAN（mwan3/负载均衡）环境下，
+// 报文可能携带 wan1 的源 IP 却从 wan2 发出，被上游 uRPF 或认证 AC 丢弃，
+// 表现为探测/心跳黑洞（无 302 重定向）。SO_BINDTODEVICE 在选路之前强制锁定出接口，
+// 使 Linux 行为与 Windows 强主机模型一致。
+// 返回 nil 表示设备绑定不可用（非 Linux 平台、设备不存在或无权限），
+// 此时退回仅绑定源 IP 的旧行为。
+var bindToDeviceFunc = func(ifName string) func(network, address string, c syscall.RawConn) error {
+	return nil
+}
+
 // NewHttpTransport 根据配置创建HTTP传输层，支持绑定指定网络接口
 func NewHttpTransport(c *Config) (http.RoundTripper, error) {
 	if c.BindInterface != "" && c.BindInterface != "sys_default" {
@@ -167,12 +179,16 @@ func NewHttpTransport(c *Config) (http.RoundTripper, error) {
 			return cachedIP
 		}
 
+		control := bindToDeviceFunc(ifName)
 		return &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				d := net.Dialer{
 					LocalAddr: &net.TCPAddr{IP: freshIP()},
 					Timeout:   10 * time.Second,
 					Resolver:  resolver,
+				}
+				if control != nil {
+					d.Control = control
 				}
 				return d.DialContext(ctx, network, addr)
 			},
@@ -204,12 +220,20 @@ func GetResolver(c *Config, localIP net.IP) *net.Resolver {
 		udpAddr = &net.UDPAddr{IP: localIP}
 	}
 
+	// 仅当绑定了真实网卡时才锁定设备；sys_default/空 表示用系统默认路由，不锁定
+	var control func(network, address string, c syscall.RawConn) error
+	if c.BindInterface != "" && c.BindInterface != "sys_default" {
+		control = bindToDeviceFunc(c.BindInterface)
+	}
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{
 				Timeout:   5 * time.Second,
 				LocalAddr: udpAddr,
+			}
+			if control != nil {
+				d.Control = control
 			}
 			return d.DialContext(ctx, "udp", c.DnsAddress)
 		},

@@ -6,6 +6,10 @@ After=network.target
 Type=simple
 User=esurfing
 Group=esurfing
+# SO_BINDTODEVICE 需要提升能力（多 WAN 下锁定认证报文出接口）；
+# 无此能力时程序会降级为仅绑源 IP，多 WAN 环境下可能认证黑洞
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 ExecStart=/usr/bin/esurfing-go-webui -c /etc/esurfing-webui/config.json
 WorkingDirectory=/var/lib/esurfing-webui
 Restart=on-failure

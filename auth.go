@@ -12,9 +12,13 @@ import (
 )
 
 // Auth 执行完整认证流程：获取学校信息 -> 获取配置 -> 获取算法ID -> 获取票据 -> 登录
+// URL 为空时（黑洞强制重认证）复用上次认证的重定向 URL：门户地址通常为 IP 直连，
+// 不依赖 DNS，可在 DNS 黑洞场景下独立完成重认证
 func (c *Client) Auth(URL string) error {
 	log := c.Log
-	c.RedirectUrl = URL
+	if URL != "" {
+		c.RedirectUrl = URL
+	}
 
 	err := c.GetSchoolInfo()
 	if err != nil {
