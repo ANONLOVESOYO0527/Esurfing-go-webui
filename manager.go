@@ -661,18 +661,22 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 		mc.NextHeartbeat = ""
 		mc.mu.Unlock()
 
-		// 保存会话信息，用于意外退出后恢复
+		// 保存会话信息，用于意外退出后恢复；同时保存门户入口与网络配置，
+		// 恢复后黑洞重认证复用 RedirectUrl、兜底 term 按原接口出报文
 		if err := SaveSession(m.sessionsDir, name, &SessionData{
-			ClientID: client.ClientID.String(),
-			Hostname: client.Hostname,
-			Mac:      client.MacAddress,
-			UserIP:   client.UserIP,
-			AcIP:     client.AcIP,
-			AlgoID:   client.AlgoID,
-			Ticket:   client.Ticket,
-			KeepUrl:  client.KeepUrl,
-			TermUrl:  client.TermUrl,
-			IndexUrl: client.IndexUrl,
+			ClientID:      client.ClientID.String(),
+			Hostname:      client.Hostname,
+			Mac:           client.MacAddress,
+			UserIP:        client.UserIP,
+			AcIP:          client.AcIP,
+			AlgoID:        client.AlgoID,
+			Ticket:        client.Ticket,
+			KeepUrl:       client.KeepUrl,
+			TermUrl:       client.TermUrl,
+			IndexUrl:      client.IndexUrl,
+			RedirectUrl:   client.RedirectUrl,
+			BindInterface: mc.BindInterface,
+			DnsAddress:    mc.DnsAddress,
 		}); err != nil {
 			m.logHub.Add(LevelError, fmt.Sprintf("[%s] save session failed: %v", name, err))
 		}
@@ -883,15 +887,28 @@ func (m *Manager) sendTermFromSession(sd *SessionData, name string) bool {
 	if cipher == nil {
 		return false
 	}
+
+	// 会话绑定了网卡时按原配置重建传输层：多 WAN 下 term 报文必须从
+	// 认证时的出接口发出才能到达对应 AC；重建失败则退回默认路由（旧行为）
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if sd.BindInterface != "" && sd.BindInterface != "sys_default" {
+		if tr, terr := NewHttpTransport(&Config{
+			BindInterface: sd.BindInterface,
+			DnsAddress:    sd.DnsAddress,
+		}); terr == nil {
+			httpClient.Transport = tr
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	tmpClient := &Client{
 		Config: &Config{},
-		HttpClient: &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		HttpClient: httpClient,
 		Ctx:        ctx,
 		Cancel:     cancel,
 		ClientID:   clientID,

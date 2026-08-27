@@ -10,17 +10,27 @@ import (
 
 // SessionData 持久化的认证会话信息，用于意外退出后恢复心跳
 type SessionData struct {
-	ClientID  string `json:"client_id"`
-	Hostname  string `json:"hostname"`
-	Mac       string `json:"mac"`
-	UserIP    string `json:"user_ip"`
-	AcIP      string `json:"ac_ip"`
-	AlgoID    string `json:"algo_id"`
-	Ticket    string `json:"ticket"`
-	KeepUrl   string `json:"keep_url"`
-	TermUrl   string `json:"term_url"`
-	IndexUrl  string `json:"index_url"`
-	SavedAt   string `json:"saved_at"`
+	ClientID string `json:"client_id"`
+	Hostname string `json:"hostname"`
+	Mac      string `json:"mac"`
+	UserIP   string `json:"user_ip"`
+	AcIP     string `json:"ac_ip"`
+	AlgoID   string `json:"algo_id"`
+	Ticket   string `json:"ticket"`
+	KeepUrl  string `json:"keep_url"`
+	TermUrl  string `json:"term_url"`
+	IndexUrl string `json:"index_url"`
+
+	// RedirectUrl 门户入口地址：恢复会话后若遇黑洞需强制重认证，
+	// 复用它可脱离 DNS（门户地址通常为 IP 直连）
+	RedirectUrl string `json:"redirect_url,omitempty"`
+
+	// BindInterface/DnsAddress 认证时的网络配置：
+	// 兜底发送 term 需按原认证路径绑定出接口（多 WAN 场景）
+	BindInterface string `json:"bind_interface,omitempty"`
+	DnsAddress    string `json:"dns_address,omitempty"`
+
+	SavedAt string `json:"saved_at"`
 }
 
 // sessionPath 返回会话文件路径，name 经 filepath.Base 规整防止路径遍历

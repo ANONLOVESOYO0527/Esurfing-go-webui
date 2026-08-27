@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -94,6 +95,9 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
+	// 门户可能通过 Set-Cookie 维持会话上下文，协议分析建议保留 CookieJar
+	jar, _ := cookiejar.New(nil)
+
 	rid := GenerateRandomString(5)
 
 	if config.BindInterface == "" {
@@ -120,6 +124,7 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 				return http.ErrUseLastResponse
 			},
 			Transport: transport,
+			Jar:       jar,
 		},
 		AlgoID: "00000000-0000-0000-0000-000000000000",
 		Log: log.New(
@@ -219,9 +224,12 @@ func (c *Client) SendHeartbeat() error {
 		return err
 	}
 
-	interval, err := strconv.Atoi(stateResp.Interval)
-	if err != nil {
-		return err
+	interval, parseErr := strconv.Atoi(stateResp.Interval)
+	if parseErr != nil || interval <= 0 {
+		// interval 是服务端可选下发的字段：缺失或非法时保持现有间隔，
+		// 心跳本身已成功送达，不应计入连续失败（否则会造成误判掉线）
+		c.logf("debug", "heartbeat interval not updated (%q)", stateResp.Interval)
+		return nil
 	}
 
 	c.heartBeatTicker.Reset(time.Duration(interval) * time.Second)
@@ -282,6 +290,8 @@ func (c *Client) CheckNetwork() error {
 
 	case http.StatusFound:
 		c.consecutiveCheckFailures = 0
+		// 探测重定向响应本身也可能携带路由头，先采集再进入认证链
+		c.harvestCDC(resp)
 		c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
 		c.logln("info", "auth required")
 		if c.OnStatusChange != nil {
@@ -344,6 +354,8 @@ func (c *Client) TryResume(sd *SessionData) bool {
 	c.KeepUrl = sd.KeepUrl
 	c.TermUrl = sd.TermUrl
 	c.IndexUrl = sd.IndexUrl
+	// 恢复门户入口地址：进程重启后黑洞自愈的强制重认证需要复用它
+	c.RedirectUrl = sd.RedirectUrl
 
 	// 重建加密器
 	c.cipher = NewCipher(c.AlgoID)

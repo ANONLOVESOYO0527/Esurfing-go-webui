@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // GetInterfaceIP 获取指定网络接口的 IPv4 地址
@@ -55,6 +56,54 @@ func GetInterfaceIP(interfaceName string) (string, error) {
 	return "", fmt.Errorf("no available ipv4 address at interface %s", interfaceName)
 }
 
+// maxCDCHeaderValueLen 单个路由头存储上限：防止异常/恶意大响应撑爆内存，
+// 也避免把超长值回传到后续请求头导致上游拒绝
+const maxCDCHeaderValueLen = 128
+
+// clampCDCValue 规整路由头值：去空白、限长。
+func clampCDCValue(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) > maxCDCHeaderValueLen {
+		return v[:maxCDCHeaderValueLen]
+	}
+	return v
+}
+
+// sanitizeSnippet 将远端返回的字节片段安全化为可打印文本（用于日志与错误信息）：
+// 先截断再替换非法 UTF-8 与控制字符，防止终端转义注入与日志伪造；
+// 保留换行/制表符便于阅读 XML 报文类内容。
+func sanitizeSnippet(data []byte, max int) string {
+	if len(data) > max {
+		data = data[:max]
+	}
+	s := strings.ToValidUTF8(string(data), "?")
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			b.WriteByte('.')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// extractJSRedirect 从 HTML 中提取 JavaScript 页面跳转地址（location.href 等），
+// 返回原始（可能相对的）跳转串；未命中返回空字符串。
+func extractJSRedirect(content string) string {
+	for _, pat := range []string{
+		`location.href="`, `location.replace("`, `window.location="`, `window.location.href="`,
+	} {
+		if i := strings.Index(content, pat); i >= 0 {
+			start := i + len(pat)
+			if end := strings.Index(content[start:], `"`); end > 0 {
+				return content[start : start+end]
+			}
+		}
+	}
+	return ""
+}
+
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 // GenerateRandomString 生成指定长度的随机字符串
@@ -83,7 +132,13 @@ func GenerateRandomMAC() string {
 	return net.HardwareAddr(mac).String()
 }
 
-// DecodeAlgoID 从二进制数据中解析算法ID和密钥
+// DecodeAlgoID 解析 ZSM 握手响应，返回算法 ID 与密钥材料。
+// 官方客户端逆向确认的二进制格式：
+//
+//	[4 字节头，其中 byte[3]=keyLen] [keyLen 字节 key] [1 字节分隔符 '$'] [36 字节 UUID = Algo-ID] ...
+//
+// key 仅作透传（真正加解密用本地固定密钥表）；若把分隔符字节当长度读会碰巧工作
+//（'$'=0x24=36 恰好等于 UUID 长度），但语义错误，此处按官方格式固定读取。
 func DecodeAlgoID(data []byte) (algoID string, key string, err error) {
 	dataLen := len(data)
 	if dataLen < 4 {
@@ -99,39 +154,57 @@ func DecodeAlgoID(data []byte) (algoID string, key string, err error) {
 	keyBytes := data[pos : pos+len1]
 	pos += len1
 
+	// 跳过 1 字节分隔符（官方为 '$'）
 	if pos >= dataLen {
-		return "", "", errors.New("data Error: missing algoID header")
+		return "", "", errors.New("data Error: missing algoID separator")
 	}
-
-	len2 := int(data[pos])
 	pos++
 
-	if pos+len2 > dataLen {
+	const algoIDLen = 36 // 标准格式下 Algo-ID 是定长 36 字节的 UUID 字符串
+	if pos+algoIDLen > dataLen {
 		return "", "", errors.New("data Error: algoID length exceeds data size")
 	}
-	algoIDBytes := data[pos : pos+len2]
+	algoIDBytes := data[pos : pos+algoIDLen]
 
 	return string(algoIDBytes), string(keyBytes), nil
 }
 
-const ConfigStartTag = "<!--//config.campus.js.chinatelecom.com "
+// ConfigStartTag 门户配置块起始标记（无尾随空格：真实页面中后面跟随换行或属性文本，
+// 匹配时不应依赖分隔符的具体形态）
+const ConfigStartTag = "<!--//config.campus.js.chinatelecom.com"
 const ConfigEndTag = "//config.campus.js.chinatelecom.com-->"
 
-// FormatEConfig 从HTML中提取并格式化服务器配置XML
+// FormatEConfig 从HTML中提取并格式化服务器配置XML。
+// 用前缀定位而非 Split 精确匹配：兼容起始标记后接空格、换行或属性文本等多种页面形态；
+// 起始标记到结束标记之间的残余内容可能包含属性文本（如 "width=720"），
+// 配置块真正的起点是其后第一个 '<'。
 func FormatEConfig(data []byte) ([]byte, error) {
-	str1 := strings.Split(string(data), ConfigStartTag)
-	if len(str1) < 2 {
+	s := string(data)
+
+	startLen := len(ConfigStartTag)
+	idx := strings.Index(s, ConfigStartTag)
+	if idx < 0 {
 		return nil, errors.New("config start tag not found in response")
 	}
-	str2 := strings.Split(str1[1], ConfigEndTag)
-	if len(str2) < 1 {
+	rest := s[idx+startLen:]
+
+	endIdx := strings.Index(rest, ConfigEndTag)
+	if endIdx < 0 {
 		return nil, errors.New("config end tag not found in response")
 	}
+	rest = rest[:endIdx]
 
-	str3 := strings.ReplaceAll(str2[0], "&width=0", "")
-	str4 := strings.ReplaceAll(str3, "&adtype=0", "")
+	// 跳到配置块第一个元素：残留的空格/换行/属性文本全部丢弃
+	if ltIdx := strings.Index(rest, "<"); ltIdx >= 0 {
+		rest = rest[ltIdx:]
+	} else {
+		rest = strings.TrimLeft(rest, " \t\r\n")
+	}
 
-	return []byte(str4), nil
+	rest = strings.ReplaceAll(rest, "&width=0", "")
+	rest = strings.ReplaceAll(rest, "&adtype=0", "")
+
+	return []byte(rest), nil
 }
 
 // bindToDeviceFunc 返回将 socket 绑定到指定网络设备的 Control 回调（Linux）。

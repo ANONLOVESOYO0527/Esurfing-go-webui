@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"time"
 )
 
@@ -12,6 +14,14 @@ import (
 const (
 	UserAgentAndroid = "CCTP/android64_vpn/2093"
 )
+
+// cstZone 协议要求 local-time 固定使用东八区（设备本地时区可能被配置为 UTC 等）
+var cstZone = time.FixedZone("CST", 8*3600)
+
+// xmlLocalTime 返回东八区 yyyy-MM-dd HH:mm:ss 格式的当前时间，用于 XML 报文 local-time 字段
+func xmlLocalTime() string {
+	return time.Now().In(cstZone).Format(time.DateTime)
+}
 
 // maxHTTPBody 限制 HTTP 响应体读取上限（10MB），防止异常/恶意大响应耗尽内存
 const maxHTTPBody = 10 << 20
@@ -94,7 +104,7 @@ type EConfig struct {
 	XMLName   xml.Name `xml:"config"`
 	Text      string   `xml:",chardata"`
 	TicketURL string   `xml:"ticket-url"`
-	AuthURL string   `xml:"auth-url"`
+	AuthURL   string   `xml:"auth-url"`
 }
 
 // GenerateGetTicketXML 生成获取票据的XML请求
@@ -102,7 +112,7 @@ func (c *Client) GenerateGetTicketXML() ([]byte, error) {
 	tr := TicketRequest{
 		UserAgent: UserAgentAndroid,
 		ClientID:  c.ClientID.String(),
-		LocalTime: time.Now().Format(time.DateTime),
+		LocalTime: xmlLocalTime(),
 		HostName:  c.Hostname,
 		Ipv4:      c.UserIP,
 		Mac:       c.MacAddress,
@@ -121,7 +131,7 @@ func (c *Client) GenerateStateXML() ([]byte, error) {
 	s := &State{
 		UserAgent: UserAgentAndroid,
 		ClientID:  c.ClientID.String(),
-		LocalTime: time.Now().Format(time.DateTime),
+		LocalTime: xmlLocalTime(),
 		HostName:  c.Hostname,
 		Ipv4:      c.UserIP,
 		Ticket:    c.Ticket,
@@ -142,7 +152,7 @@ func (c *Client) GenerateLoginXML() ([]byte, error) {
 		UserAgent: UserAgentAndroid,
 		ClientID:  c.ClientID.String(),
 		Ticket:    c.Ticket,
-		LocalTime: time.Now().Format(time.DateTime),
+		LocalTime: xmlLocalTime(),
 		Userid:    c.Config.Username,
 		Passwd:    c.Config.Password,
 	}
@@ -161,26 +171,39 @@ func (c *Client) PostXML(url string, data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.postEncryptedXML(url, encXML)
+}
 
+// postEncryptedXML 用客户端默认上下文构造并执行加密 POST
+func (c *Client) postEncryptedXML(url string, encXML []byte) ([]byte, error) {
 	req, err := c.NewPostRequest(url, encXML)
 	if err != nil {
 		return nil, err
 	}
+	return c.executeEncryptedPost(req, url)
+}
 
+// executeEncryptedPost 执行已加密的 POST 并解密响应。
+// 非 2xx（网关错误页等）无法解密，直接失败并携带状态码与响应片段，便于诊断。
+func (c *Client) executeEncryptedPost(req *http.Request, url string) ([]byte, error) {
 	response, err := c.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if response == nil {
-		return nil, errors.New("nil response from PostXML request")
+		return nil, errors.New("nil response from encrypted post")
 	}
 	defer func(Body io.ReadCloser) {
 		_ = Body.Close()
 	}(response.Body)
 
-	data, err = io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
 	if err != nil {
 		return nil, err
+	}
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("http %d from %s: %s", response.StatusCode, url, sanitizeSnippet(data, 120))
 	}
 
 	return c.cipher.Decrypt(data)
@@ -201,21 +224,5 @@ func (c *Client) PostXMLWithTimeout(url string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	response, err := c.HttpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if response == nil {
-		return nil, errors.New("nil response from PostXMLWithTimeout request")
-	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(response.Body)
-
-	data, err = io.ReadAll(io.LimitReader(response.Body, maxHTTPBody))
-	if err != nil {
-		return nil, err
-	}
-
-	return c.cipher.Decrypt(data)
+	return c.executeEncryptedPost(req, url)
 }
