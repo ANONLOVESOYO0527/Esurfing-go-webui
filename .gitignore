@@ -34,3 +34,9 @@ config.json
 # KAT 真值必须入库（cipher_test.go 对拍依赖）
 !testdata/kat/*.json
 esurfing_data/
+
+# Local build artifacts
+build/
+
+# Stray Windows NUL device redirect file
+nul

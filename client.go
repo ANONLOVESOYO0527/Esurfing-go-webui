@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -68,6 +69,24 @@ type Client struct {
 	// 的单一恢复路径：多 WAN 负载均衡下报文选路不对称、上游 uRPF 丢弃等场景
 	// 会造成黑洞（无响应、无重定向），旧逻辑此时会永久卡死。
 	consecutiveCheckFailures int
+
+	// consecutiveHeartbeatFails 连续心跳失败计数（独立于检查计数：
+	// “门户不可达但外网正常”的退化期，心跳失败后的 recheck 会成功，
+	// 若共用计数器会被成功 recheck 清零，心跳阈值永远无法触发——
+	// 实测事故中三次心跳失败均停在 (1 consecutive) 即此缺陷）。
+	// 仅由成功的心跳清零。
+	consecutiveHeartbeatFails int
+
+	// consecutiveAuthFails 连续认证失败次数，驱动指数退避（authBackoff）。
+	// 成功认证时清零；确认在线（204/IP 探针可达未劫持）不清零：
+	// 会话状态丢失时的重认领节奏由退避控制，若被在线态清零会退化为
+	// 每 tick 一次的高频重认证风暴（实测事故后审发现的缺陷）。
+	consecutiveAuthFails int
+
+	// heartbeatPaused 心跳当前是否处于暂停态（ticker 停在 MaxInt64）。
+	// 暂停发生在 302 检测与心跳失败强制重认证两处；恢复点：Login 成功、
+	// 心跳成功、以及 204 恢复后对完好会话的重启（recoverAfterOnline）。
+	heartbeatPaused bool
 }
 
 func (c *Client) logf(level, format string, v ...interface{}) {
@@ -94,6 +113,32 @@ const zeroAlgoID = "00000000-0000-0000-0000-000000000000"
 // blackholeReauthThreshold 连续网络检查异常达到此次数后触发主动重认证。
 // 取 3：默认 10s 检查间隔下约 30s 判定网络黑洞，远小于会话超时，误判代价低。
 const blackholeReauthThreshold = 3
+
+// maxAuthBackoffShift 连续认证失败指数退避的最大倍移：退避上限为 retry_interval 的 16 倍。
+// 长时间黑洞下高频认证请求可能触发校园网风控加重处罚，指数退避降低请求频率。
+const maxAuthBackoffShift = 4
+
+// defaultHeartbeatInterval 服务端未下发心跳间隔时的兜底值（秒），与 Login 响应
+// keep-retry 缺失时的兜底一致。
+const defaultHeartbeatInterval = 60
+
+// checkURL 主探测 URL（域名形态，依赖 DNS）：204=在线，302=未认证。
+const checkURL = "http://connect.rom.miui.com/generate_204"
+
+// fallbackProbeTimeout 单次 IP 直连探测的超时。探测在检查循环内串行执行，
+// 过长会拖慢黑洞判定，过短易误判丢包，取 4 秒。
+const fallbackProbeTimeout = 4 * time.Second
+
+// fallbackProbeURLs DNS 无关的公共探针（IP 直连，无域名解析），按序尝试：
+//  1. CheckNetwork 回退探测：校园网认证失效时 DNS 通常被一并切断，域名探测必然
+//     超时；IP 直连可区分「会话失效（被 BRAS 劫持 302）」「仅 DNS 受损（有响应）」
+//     「真黑洞（全部超时）」三种状态，避免把可恢复状态误判成黑洞反复重认证；
+//  2. discoverRedirectEntry：探针被劫持时 302 的 Location 即门户入口。
+// 候选为国内公共 DNS 的 HTTP 端点（实测稳定响应 404，延迟 <50ms）。
+var fallbackProbeURLs = []string{
+	"http://223.5.5.5/",
+	"http://119.29.29.29/",
+}
 
 // NewClient 创建认证客户端，使用外部提供的 ctx/cancel
 func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (*Client, error) {
@@ -144,6 +189,7 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 			log.LstdFlags|log.Lmsgprefix,
 		),
 		heartBeatTicker: time.NewTicker(time.Duration(math.MaxInt64)),
+		heartbeatPaused: true,
 	}
 	cl.resolveUAChain()
 
@@ -211,6 +257,43 @@ func (c *Client) resetSession() {
 	}
 }
 
+// pauseHeartbeat 暂停心跳：进入认证链/强制重认证前调用，避免旧会话心跳与
+// 认证请求交叠。恢复点见 resumeHeartbeat。
+func (c *Client) pauseHeartbeat() {
+	c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
+	c.heartbeatPaused = true
+}
+
+// resumeHeartbeat 恢复心跳：优先使用服务端最近一次下发的间隔，缺失时兜底。
+func (c *Client) resumeHeartbeat() {
+	interval := c.lastHeartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	c.heartBeatTicker.Reset(time.Duration(interval) * time.Second)
+	c.heartbeatPaused = false
+}
+
+// authBackoff 当前状态下的认证重试退避间隔：以 retry_interval 为基，连续失败
+// 每次翻倍，封顶 16 倍。长时间黑洞下高频认证可能触发校园网风控加重处罚。
+// RetryInterval <= 0（RetryIntervalNever 已在 NewClient 归一为极大值）不会走到 0 分支，
+// 此处对 0/负值返回 0 表示不退避，由调用方决定语义。
+func (c *Client) authBackoff() time.Duration {
+	base := time.Duration(c.Config.RetryInterval) * time.Millisecond
+	if base <= 0 {
+		return 0
+	}
+	shift := c.consecutiveAuthFails - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > maxAuthBackoffShift {
+		shift = maxAuthBackoffShift
+	}
+	return base << uint(shift)
+}
+
+
 // Start 启动客户端主循环，定期检测网络状态并发送心跳
 func (c *Client) Start() {
 	c.logln("info", "client start")
@@ -219,6 +302,9 @@ func (c *Client) Start() {
 
 	if err := c.CheckNetwork(); err != nil {
 		c.logf("warn", "network check failed: %v", err)
+		// 首次探测失败同样计入黑洞判定：enable-during-blackhole 场景下
+		// 不应白白丢弃这一次失败信号，否则阈值判定被推迟一个检查周期
+		c.consecutiveCheckFailures++
 	}
 
 	ticker := time.NewTicker(time.Millisecond * time.Duration(c.Config.CheckInterval))
@@ -231,7 +317,7 @@ func (c *Client) Start() {
 			return
 		case <-ticker.C:
 			if !c.lastAuthFail.IsZero() && c.Config.RetryInterval > 0 {
-				remain := time.Duration(c.Config.RetryInterval)*time.Millisecond - time.Since(c.lastAuthFail)
+				remain := c.authBackoff() - time.Since(c.lastAuthFail)
 				if remain > 0 {
 					c.logf("debug", "retry cooldown, waiting %v", remain)
 					continue
@@ -254,20 +340,10 @@ func (c *Client) Start() {
 		case <-c.heartBeatTicker.C:
 			err := c.SendHeartbeat()
 			if err != nil {
-				c.logf("warn", "send heartbeat error: %v", err)
-				c.consecutiveCheckFailures++
-				c.logf("warn", "heartbeat failed (%d consecutive)", c.consecutiveCheckFailures)
-				// 心跳连续失败同样说明会话疑似已死：达到阈值时停发心跳并强制重认证。
-				if c.consecutiveCheckFailures >= blackholeReauthThreshold {
-					c.logln("warn", "heartbeat failed repeatedly, forcing re-auth")
-					c.consecutiveCheckFailures = 0
-					c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
-					c.HandleRedirect(nil)
-				} else if err := c.CheckNetwork(); err != nil {
-					c.logf("warn", "network recheck failed: %v", err)
-				}
+				c.onHeartbeatError(err)
 			} else {
 				c.consecutiveCheckFailures = 0
+				c.consecutiveHeartbeatFails = 0
 				c.logln("debug", "send heartbeat")
 				if c.OnStatusChange != nil {
 					c.OnStatusChange("online")
@@ -277,6 +353,23 @@ func (c *Client) Start() {
 				}
 			}
 		}
+	}
+}
+
+// onHeartbeatError 心跳失败处理：独立计数（consecutiveHeartbeatFails），达到
+// 阈值时停发心跳并强制重认证；未达阈值时同步做一次网络检查（仅作诊断日志，
+// 其成功不得清零心跳计数——否则“门户退化但外网正常”期间阈值永不到达）。
+func (c *Client) onHeartbeatError(err error) {
+	c.logf("warn", "send heartbeat error: %v", err)
+	c.consecutiveHeartbeatFails++
+	c.logf("warn", "heartbeat failed (%d consecutive)", c.consecutiveHeartbeatFails)
+	if c.consecutiveHeartbeatFails >= blackholeReauthThreshold {
+		c.logln("warn", "heartbeat failed repeatedly, forcing re-auth")
+		c.consecutiveHeartbeatFails = 0
+		c.pauseHeartbeat()
+		c.HandleRedirect(nil)
+	} else if cerr := c.CheckNetwork(); cerr != nil {
+		c.logf("warn", "network recheck failed: %v", cerr)
 	}
 }
 
@@ -305,8 +398,8 @@ func (c *Client) SendHeartbeat() error {
 		return nil
 	}
 
-	c.heartBeatTicker.Reset(time.Duration(interval) * time.Second)
 	c.lastHeartbeatInterval = interval
+	c.resumeHeartbeat()
 	return nil
 }
 
@@ -333,16 +426,58 @@ func (c *Client) Logout() {
 	c.logln("info", "log out request sent")
 }
 
-// CheckNetwork 检测网络状态，未认证时自动触发认证流程
+// probeGet 单次 DNS 无关 GET 探测（独立短超时，不占用 c.Ctx 的生命周期控制）。
+func (c *Client) probeGet(ctx context.Context, url string) (*http.Response, error) {
+	request, err := c.NewGetRequestWithCustomCtx(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	return c.HttpClient.Do(request)
+}
+
+// probeWithoutDNS IP 直连探测：域名解析失败后判定真实网络状态。
+// 返回首个可达探针的响应；全部不可达时返回聚合错误（便于一次看全诊断信息）。
+func (c *Client) probeWithoutDNS() (*http.Response, error) {
+	var probeErrs []string
+	for _, u := range fallbackProbeURLs {
+		ctx, cancel := context.WithTimeout(c.Ctx, fallbackProbeTimeout)
+		resp, err := c.probeGet(ctx, u)
+		cancel()
+		if err == nil {
+			c.logf("debug", "dns-free probe %s reachable (http %d)", u, resp.StatusCode)
+			return resp, nil
+		}
+		probeErrs = append(probeErrs, fmt.Sprintf("%s: %v", u, err))
+	}
+	return nil, errors.New(strings.Join(probeErrs, "; "))
+}
+
+// CheckNetwork 检测网络状态，未认证时自动触发认证流程。
+// 域名探测因 DNS 解析失败而失败时（校园网认证失效的典型伴生症状，黑洞期
+// DNS 与普通流量一同被切），回退 IP 直连探测细分三种状态：
+//   - 302（被 BRAS 劫持）→ 未认证，进入认证链；
+//   - 其他 HTTP 响应（404/200 等）→ 网络路径可达、仅 DNS 受损 → 视为在线，
+//     不计失败（否则纯 DNS 抖动会触发无意义的重认证循环）；
+//   - 全部超时/失败 → 真黑洞，返回错误交由调用方计数。
 func (c *Client) CheckNetwork() error {
-	request, err := c.NewGetRequest("http://connect.rom.miui.com/generate_204")
+	request, err := c.NewGetRequest(checkURL)
 	if err != nil {
 		return err
 	}
 
 	resp, err := c.HttpClient.Do(request)
+	viaFallback := false
 	if err != nil {
-		return err
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) {
+			return err
+		}
+		// DNS 解析失败：降级为 DNS 无关探测，避免把“仅 DNS 受损”误判为黑洞
+		resp, err = c.probeWithoutDNS()
+		if err != nil {
+			return fmt.Errorf("dns check failed: %v; dns-free probes also failed: %w", dnsErr, err)
+		}
+		viaFallback = true
 	}
 	if resp == nil {
 		return errors.New("nil response")
@@ -353,29 +488,60 @@ func (c *Client) CheckNetwork() error {
 		}
 	}(resp.Body)
 
-	switch resp.StatusCode {
-	case http.StatusNoContent:
+	switch {
+	case resp.StatusCode == http.StatusNoContent:
 		c.consecutiveCheckFailures = 0
+		// 注意：此处不清认证失败退避状态（lastAuthFail/consecutiveAuthFails）。
+		// 会话丢失时的重认领节奏由退避控制；若被在线态清零，退避失效。
+		c.recoverAfterOnline()
 		if c.OnStatusChange != nil {
 			c.OnStatusChange("online")
 		}
 		return nil
 
-	case http.StatusFound:
+	case resp.StatusCode == http.StatusFound || (viaFallback && isRedirectStatus(resp.StatusCode)):
 		c.consecutiveCheckFailures = 0
 		// 探测重定向响应本身也可能携带路由头，先采集再进入认证链
 		c.harvestCDC(resp)
-		c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
+		c.pauseHeartbeat()
 		c.logln("info", "auth required")
 		if c.OnStatusChange != nil {
 			c.OnStatusChange("auth")
 		}
 		return c.HandleRedirect(resp)
 
+	case viaFallback:
+		// IP 探针可达但未被劫持：仅 DNS 受损，视为在线（同样不清认证退避状态）
+		c.consecutiveCheckFailures = 0
+		c.recoverAfterOnline()
+		if c.OnStatusChange != nil {
+			c.OnStatusChange("online")
+		}
+		return nil
+
 	default:
 		// 非 204/302（如 200 弹窗页、502 网关错误）：视为异常，交给调用方计数
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
+}
+
+// recoverAfterOnline 会话状态自愈：网络恢复但本 client 不持有有效会话时主动重建，
+// 消除“在线但无人保活”的僵户窗口——BRAS 侧旧会话可能仍有效，但本 client 的
+// 会话字段已被失败的强制重认证清空（resetSession），既发不出心跳也无法感知
+// 服务端后续踢会话；放任不管则最长数小时后服务端超时才会以 302 触发重认证。
+func (c *Client) recoverAfterOnline() {
+	if !c.authed.Load() {
+		return // 从未认证过：仅监控，等首次 302 触发认证
+	}
+	if c.KeepUrl != "" {
+		// 会话字段完好但心跳被暂停（如认证链中途失败后网络自行恢复）：重启心跳
+		if c.heartbeatPaused {
+			c.resumeHeartbeat()
+		}
+		return
+	}
+	c.logln("warn", "online but session state lost, re-adopting session")
+	_ = c.HandleRedirect(nil)
 }
 
 // HandleRedirect 处理 302 重定向，执行认证。
@@ -392,6 +558,7 @@ func (c *Client) HandleRedirect(resp *http.Response) error {
 	if err := c.Auth(redirectURL); err != nil {
 		c.logf("warn", "auth failed: %v", err)
 		c.lastAuthFail = time.Now()
+		c.consecutiveAuthFails++
 		if c.OnStatusChange != nil {
 			c.OnStatusChange("offline")
 		}
@@ -399,6 +566,7 @@ func (c *Client) HandleRedirect(resp *http.Response) error {
 	}
 
 	c.lastAuthFail = time.Time{}
+	c.consecutiveAuthFails = 0
 	c.logln("ok", "auth finished")
 	if c.OnStatusChange != nil {
 		c.OnStatusChange("online")

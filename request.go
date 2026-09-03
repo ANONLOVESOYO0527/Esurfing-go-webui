@@ -81,6 +81,23 @@ func (c *Client) NewPostRequestWithCustomCtx(ctx context.Context, url string, da
 	return req, nil
 }
 
+// NewGetRequestWithCustomCtx 创建带认证头与自定义上下文的 GET 请求（用于超时控制，
+// 如 DNS 黑洞场景下的短超时 IP 直连探测）。
+func (c *Client) NewGetRequestWithCustomCtx(ctx context.Context, url string) (request *http.Request, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", c.currentUA())
+	req.Header.Set("Accept", cctpAccept)
+	req.Header.Set("Client-ID", c.ClientID.String())
+	req.Header.Set("Connection", "keep-alive")
+	c.setCDCRoutingHeaders(req)
+
+	return req, nil
+}
+
 // respCDCHeader 从响应读取路由头，兼容 CDC-* 与裸变体（如 schoolid/CDC-SchoolId）。
 // Go 的 Header.Get 会规范化大小写，两种发送形态均可命中。
 func respCDCHeader(resp *http.Response, name string) string {

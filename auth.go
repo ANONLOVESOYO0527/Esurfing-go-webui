@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -34,12 +35,19 @@ func isUAFallbackError(err error) bool {
 
 // Auth 执行完整认证流程：解析 UA 回退链 → 逐 UA 尝试（学校信息→配置→算法ID→票据→登录）。
 // URL 为空时（黑洞强制重认证）复用上次认证的重定向 URL：门户地址通常为 IP 直连，
-// 不依赖 DNS，可在 DNS 黑洞场景下独立完成重认证。
+// 不依赖 DNS，可在 DNS 黑洞场景下独立完成重认证；若无缓存入口（本 client 从未
+// 认证成功）则先经 discoverRedirectEntry 用 DNS 无关探针发现门户入口，否则
+// GetSchoolInfo 必然以 missing redirect URL 秒败，黑洞自愈形同虚设。
 // 回退触发条件（实测语义见 docs/05 §3.3、§12）：门户页不可用 / ZSM 被拒 /
 // ZSM 空体或不可解析 / 未知 GUID（第四代兑底）；链耗尽时列出全部尝试记录。
 func (c *Client) Auth(URL string) error {
 	if URL != "" {
 		c.RedirectUrl = URL
+	} else if c.RedirectUrl == "" {
+		// 强制重认证且无缓存入口：先经 DNS 无关探针发现门户入口
+		if err := c.discoverRedirectEntry(); err != nil {
+			return fmt.Errorf("missing redirect URL: %w", err)
+		}
 	}
 
 	c.resolveUAChain()
@@ -176,6 +184,74 @@ func (c *Client) GetEConfig() error {
 	c.AuthUrl = eConfig.AuthURL
 
 	return nil
+}
+
+// discoverRedirectEntry 黑洞自愈入口发现：强制重认证无缓存入口且探测 URL 因
+// DNS 黑洞拿不到 302 时，用 DNS 无关的手段寻找门户入口：
+//  1. 公共 IP 探针被 BRAS 劫持 → 302 的 Location 即门户入口（与正常认证链同源，
+//     含 wlanuserip/wlanacip 参数）；
+//  2. 本进程上次会话的门户地址（keep/term/index 与门户同源，IP 直连不依赖
+//     DNS）→ 作为入口交由 GetSchoolInfo/GetEConfig 尝试解析。
+//
+// 必须在认证链的 resetSession 之前调用（候选门户地址依赖尚未清空的会话字段）。
+func (c *Client) discoverRedirectEntry() error {
+	var probeErrs []string
+	for _, u := range fallbackProbeURLs {
+		ctx, cancel := context.WithTimeout(c.Ctx, fallbackProbeTimeout)
+		resp, err := c.probeGet(ctx, u)
+		cancel()
+		if err != nil {
+			probeErrs = append(probeErrs, fmt.Sprintf("%s: %v", u, err))
+			continue
+		}
+		location := resp.Header.Get("Location")
+		c.harvestCDC(resp)
+		_ = resp.Body.Close()
+		if isRedirectStatus(resp.StatusCode) && location != "" {
+			base, perr := url.Parse(u)
+			if perr != nil {
+				probeErrs = append(probeErrs, fmt.Sprintf("%s: invalid probe url: %v", u, perr))
+				continue
+			}
+			entry, perr := base.Parse(location)
+			if perr != nil {
+				probeErrs = append(probeErrs, fmt.Sprintf("%s: invalid location %q: %v", u, location, perr))
+				continue
+			}
+			c.RedirectUrl = entry.String()
+			c.logln("info", "portal entry discovered via dns-free probe: "+c.RedirectUrl)
+			return nil
+		}
+		probeErrs = append(probeErrs, fmt.Sprintf("%s: http %d, not hijacked", u, resp.StatusCode))
+	}
+	// 上次会话缓存的门户地址（已认证 client 走不到这里——彼时 RedirectUrl 非空；
+	// 作为入口被显式清空等少数路径的兑底）
+	if base := portalBaseOf(c.KeepUrl, c.TermUrl, c.IndexUrl); base != "" {
+		c.RedirectUrl = base
+		c.logln("info", "portal entry fallback to last session portal base: "+base)
+		return nil
+	}
+	return fmt.Errorf("all dns-free probes failed: %s", strings.Join(probeErrs, "; "))
+}
+
+// portalBaseOf 从会话 URL（keep/term/index）提取门户基址 scheme://host[:port]/。
+// 这些地址与门户同源、IP 直连，不依赖 DNS；均不可解析时返回空串。
+func portalBaseOf(urls ...string) string {
+	for _, raw := range urls {
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		scheme := u.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		return scheme + "://" + u.Host + "/"
+	}
+	return ""
 }
 
 // GetSchoolInfo 沿重定向链逐跳采集学校路由信息（schoolid/domain/area），
@@ -347,12 +423,13 @@ func (c *Client) Login() error {
 		return fmt.Errorf("login rejected, no keep-url in response: %s", sanitizeSnippet(responseData, 160))
 	}
 
-	// keepRetry 解析失败时使用默认 60 秒，避免登录已成功却整体判定失败
+	// keepRetry 解析失败时使用默认间隔，避免登录已成功却整体判定失败
 	keepRetrySec, err := strconv.Atoi(loginResponseXML.KeepRetry)
 	if err != nil || keepRetrySec <= 0 {
-		keepRetrySec = 60
+		keepRetrySec = defaultHeartbeatInterval
 	}
 
-	c.heartBeatTicker.Reset(time.Second * time.Duration(keepRetrySec))
+	c.lastHeartbeatInterval = keepRetrySec
+	c.resumeHeartbeat()
 	return nil
 }
