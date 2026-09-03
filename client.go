@@ -12,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +40,12 @@ type Client struct {
 	MacAddress string
 	Ticket     string
 	AlgoID     string
+
+	// UA 回退链（docs/08 §3）：auto 模式下按序尝试，成功值记入 preferredUA。
+	// 服务端按 UA 家族分派算法池（2104→新代 9、2089→旧代 9、1003→PC 6）且按会话随机轮换。
+	uaChain     []string
+	uaIdx       int
+	preferredUA string
 
 	IndexUrl    string
 	TicketUrl   string
@@ -79,6 +86,10 @@ func (c *Client) logln(level, msg string) {
 
 // RetryIntervalNever 表示不自动重试认证（约定值，任意负数等效）
 const RetryIntervalNever = -1
+
+// zeroAlgoID ZSM 握手的初始算法 ID（首次握手 body；每次认证尝试必须重新归零，
+// 带上次 GUID 再握会被拒 Error-Code 1，docs/05 §3.2）
+const zeroAlgoID = "00000000-0000-0000-0000-000000000000"
 
 // blackholeReauthThreshold 连续网络检查异常达到此次数后触发主动重认证。
 // 取 3：默认 10s 检查间隔下约 30s 判定网络黑洞，远小于会话超时，误判代价低。
@@ -126,7 +137,7 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 			Transport: transport,
 			Jar:       jar,
 		},
-		AlgoID: "00000000-0000-0000-0000-000000000000",
+		AlgoID: zeroAlgoID,
 		Log: log.New(
 			os.Stdout,
 			"["+rid+"][user:"+config.Username+" bind_device:"+config.BindInterface+"] ",
@@ -134,8 +145,65 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 		),
 		heartBeatTicker: time.NewTicker(time.Duration(math.MaxInt64)),
 	}
+	cl.resolveUAChain()
 
 	return cl, nil
+}
+
+// currentUA 返回当前生效的 User-Agent：HTTP 头与 XML <user-agent> 报文体必须同源于此。
+// 优先上次成功值（preferredUA），其次回退链当前游标；零值 Client 兑底返回主选 UA。
+func (c *Client) currentUA() string {
+	if c.preferredUA != "" {
+		return c.preferredUA
+	}
+	if c.uaIdx >= 0 && c.uaIdx < len(c.uaChain) {
+		return c.uaChain[c.uaIdx]
+	}
+	return UAAndroid2104
+}
+
+// resolveUAChain 把配置解析为回退链（docs/08 §3.2）：
+//   - 空/"auto"（缺省）→ 默认链 [2104→2089→2093]，上次成功值置链首以跳过已知会失败的尝试；
+//   - 其他任意值（预设或手输）→ 单元素链，不做回退。
+func (c *Client) resolveUAChain() {
+	configured := strings.TrimSpace(c.Config.UserAgent)
+	auto := configured == "" || strings.EqualFold(configured, UserAgentAuto)
+
+	var chain []string
+	if auto {
+		chain = append(chain, defaultUAChain...)
+		if c.preferredUA != "" {
+			rest := make([]string, 0, len(chain))
+			for _, ua := range chain {
+				if ua != c.preferredUA {
+					rest = append(rest, ua)
+				}
+			}
+			chain = append([]string{c.preferredUA}, rest...)
+		}
+	} else {
+		chain = []string{configured}
+	}
+	c.uaChain = chain
+	c.uaIdx = 0
+}
+
+// resetSession 为一次认证尝试重置会话（uaprobe 方法论：每轮独立会话）。
+// ⚠️ AlgoID 必须归零：GetAlgoId 的 body=当前 AlgoID，成功认证后重认证若带着上次
+// GUID 再握会被拒（Error-Code 1，docs/05 §3.2）——旧代码在重认证路径上存在此隐患。
+func (c *Client) resetSession() {
+	c.ClientID = uuid.New()
+	c.Hostname = GenerateRandomString(10)
+	c.MacAddress = GenerateRandomMAC()
+	c.AlgoID = zeroAlgoID
+	c.SchoolID, c.Domain, c.Area = "", "", ""
+	c.IndexUrl, c.TicketUrl, c.AuthUrl = "", "", ""
+	c.Ticket, c.KeepUrl, c.TermUrl = "", "", ""
+	c.cipher = nil
+	// 独立 CookieJar：门户通过 Set-Cookie 维持会话上下文，跨尝试不得复用
+	if jar, err := cookiejar.New(nil); err == nil {
+		c.HttpClient.Jar = jar
+	}
 }
 
 // Start 启动客户端主循环，定期检测网络状态并发送心跳
@@ -354,6 +422,8 @@ func (c *Client) TryResume(sd *SessionData) bool {
 	c.KeepUrl = sd.KeepUrl
 	c.TermUrl = sd.TermUrl
 	c.IndexUrl = sd.IndexUrl
+	// 恢复登录时的 UA（心跳/下线报文与原会话同族），并置为后续强制重认证的首选
+	c.preferredUA = sd.UserAgent
 	// 恢复门户入口地址：进程重启后黑洞自愈的强制重认证需要复用它
 	c.RedirectUrl = sd.RedirectUrl
 

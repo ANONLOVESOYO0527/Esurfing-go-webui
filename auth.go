@@ -7,70 +7,105 @@ import (
 	"io"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // maxAuthRedirects 认证入口重定向链最大跳数（参考官方客户端：逐跳采集路由头直至门户页）
 const maxAuthRedirects = 6
 
-// Auth 执行完整认证流程：获取学校信息 -> 获取配置 -> 获取算法ID -> 获取票据 -> 登录
+// UA 回退类错误（docs/08 §3.3）：服务端按 UA 分流，换 UA 重试有意义。
+// 网络层错误（重定向链失败、超时）不属于此类——换 UA 无意义，直接失败。
+var (
+	errPortalPageUnusable = errors.New("portal page unusable for this user-agent")
+	errZSMRejected        = errors.New("zsm handshake rejected")
+	errZSMEmptyBody       = errors.New("zsm empty response")
+	errZSMUnparseable     = errors.New("zsm response unparseable")
+	errUnknownAlgoID      = errors.New("unknown algo id")
+)
+
+func isUAFallbackError(err error) bool {
+	return errors.Is(err, errPortalPageUnusable) ||
+		errors.Is(err, errZSMRejected) ||
+		errors.Is(err, errZSMEmptyBody) ||
+		errors.Is(err, errZSMUnparseable) ||
+		errors.Is(err, errUnknownAlgoID)
+}
+
+// Auth 执行完整认证流程：解析 UA 回退链 → 逐 UA 尝试（学校信息→配置→算法ID→票据→登录）。
 // URL 为空时（黑洞强制重认证）复用上次认证的重定向 URL：门户地址通常为 IP 直连，
-// 不依赖 DNS，可在 DNS 黑洞场景下独立完成重认证
+// 不依赖 DNS，可在 DNS 黑洞场景下独立完成重认证。
+// 回退触发条件（实测语义见 docs/05 §3.3、§12）：门户页不可用 / ZSM 被拒 /
+// ZSM 空体或不可解析 / 未知 GUID（第四代兑底）；链耗尽时列出全部尝试记录。
 func (c *Client) Auth(URL string) error {
 	log := c.Log
 	if URL != "" {
 		c.RedirectUrl = URL
 	}
 
-	err := c.GetSchoolInfo()
-	if err != nil {
-		return err
+	c.resolveUAChain()
+
+	var attempts []string
+	for c.uaIdx = 0; c.uaIdx < len(c.uaChain); c.uaIdx++ {
+		ua := c.uaChain[c.uaIdx]
+		c.resetSession()
+
+		if err := c.GetSchoolInfo(); err != nil {
+			return err // 网络层错误：换 UA 无意义
+		}
+		if err := c.GetEConfig(); err != nil {
+			if errors.Is(err, errPortalPageUnusable) {
+				attempts = append(attempts, fmt.Sprintf("ua=%s: %v", ua, err))
+				c.logf("warn", "portal page unusable with ua=%s: %v, trying next ua", ua, err)
+				continue
+			}
+			return err
+		}
+		if err := c.GetUserAndAcIP(); err != nil {
+			return err
+		}
+		if err := c.GetAlgoId(); err != nil {
+			if isUAFallbackError(err) {
+				attempts = append(attempts, fmt.Sprintf("ua=%s: %v", ua, err))
+				c.logf("warn", "zsm handshake failed with ua=%s: %v, trying next ua", ua, err)
+				continue
+			}
+			return err
+		}
+
+		c.cipher = NewCipher(c.AlgoID)
+		if c.cipher == nil {
+			err := fmt.Errorf("%w: %s（不在已知 24 个算法 ID 内，可能是新代际，可反馈该 GUID）",
+				errUnknownAlgoID, c.AlgoID)
+			attempts = append(attempts, fmt.Sprintf("ua=%s: %v", ua, err))
+			c.logf("warn", "%v", err)
+			continue
+		}
+
+		log.Println("user-agent:", ua)
+		log.Println("algo_id:", c.AlgoID)
+
+		// 链内成功：记忆本 UA（SessionData 持久化由 manager 回调完成），
+		// 后续 ticket/login/心跳/term 全程沿用
+		c.preferredUA = ua
+
+		if err := c.GetTicket(); err != nil {
+			return err
+		}
+
+		log.Println("ticket:", c.Ticket)
+
+		time.Sleep(time.Millisecond * 333)
+
+		if err := c.Login(); err != nil {
+			return err
+		}
+
+		c.authed.Store(true)
+		return nil
 	}
 
-	c.ClientID = uuid.New()
-	c.Hostname = GenerateRandomString(10)
-	c.MacAddress = GenerateRandomMAC()
-
-	err = c.GetEConfig()
-	if err != nil {
-		return err
-	}
-
-	err = c.GetUserAndAcIP()
-	if err != nil {
-		return err
-	}
-
-	err = c.GetAlgoId()
-	if err != nil {
-		return err
-	}
-
-	c.cipher = NewCipher(c.AlgoID)
-	if c.cipher == nil {
-		return errors.New("Unknown AlgoID:" + c.AlgoID)
-	}
-
-	log.Println("algo_id:", c.AlgoID)
-
-	err = c.GetTicket()
-	if err != nil {
-		return err
-	}
-
-	log.Println("ticket:", c.Ticket)
-
-	time.Sleep(time.Millisecond * 333)
-
-	err = c.Login()
-	if err != nil {
-		return err
-	}
-
-	c.authed.Store(true)
-	return nil
+	return fmt.Errorf("auth failed: all user agents rejected:\n  %s", strings.Join(attempts, "\n  "))
 }
 
 // GetUserAndAcIP 从票据URL中解析用户IP和AC IP
@@ -125,14 +160,16 @@ func (c *Client) GetEConfig() error {
 
 	eConfigData, err := FormatEConfig(data)
 	if err != nil {
-		return err
+		// 门户页形态随 UA 家族不同（phone 27KB / PC 22KB，docs/05 §12）：
+		// 对某 UA 无配置块时换下一个 UA 重试（如 Win/Mac 族的异形页面）
+		return fmt.Errorf("%w: %v", errPortalPageUnusable, err)
 	}
 
 	eConfig := &EConfig{}
 
 	err = xml.Unmarshal(eConfigData, eConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errPortalPageUnusable, err)
 	}
 
 	c.TicketUrl = eConfig.TicketURL
@@ -233,9 +270,23 @@ func (c *Client) GetAlgoId() error {
 		return fmt.Errorf("zsm handshake http %d: %s", response.StatusCode, sanitizeSnippet(algoIdData, 60))
 	}
 
+	// ZSM 诊断（docs/08 §4）：门户拒绝 UA 时的实测形态 = HTTP 200 + Error-Code ≠ 200 + 空 body
+	//（语义：3=UA 准入拒绝、1=请求无效、200=ZSM 成功码，docs/05 §3.3）。
+	// ⚠️ Error-Code 头**缺失**视为成功：mock 环境与部分老门户不下发该头（docs/08 §3.3 兼容规则）。
+	if ec := response.Header.Get("Error-Code"); ec != "" && ec != "200" {
+		return fmt.Errorf("%w: ua=%s error_code=%s sub_error=%q server=%q",
+			errZSMRejected, c.currentUA(), ec, response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"))
+	}
+	if len(algoIdData) == 0 {
+		return fmt.Errorf("%w: ua=%s error_code=%q sub_error=%q server=%q (0 bytes)",
+			errZSMEmptyBody, c.currentUA(),
+			response.Header.Get("Error-Code"), response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"))
+	}
+
 	c.AlgoID, _, err = DecodeAlgoID(algoIdData)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: ua=%s: %v (zsm head: %s)",
+			errZSMUnparseable, c.currentUA(), err, sanitizeSnippet(algoIdData, 64))
 	}
 
 	return nil

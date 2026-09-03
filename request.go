@@ -33,7 +33,7 @@ func (c *Client) NewGetRequest(url string) (request *http.Request, err error) {
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", UserAgentAndroid)
+	req.Header.Set("User-Agent", c.currentUA())
 	req.Header.Set("Accept", cctpAccept)
 	req.Header.Set("Client-ID", c.ClientID.String())
 	req.Header.Set("Connection", "keep-alive")
@@ -53,7 +53,7 @@ func (c *Client) NewPostRequest(url string, data []byte) (request *http.Request,
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", UserAgentAndroid)
+	req.Header.Set("User-Agent", c.currentUA())
 	req.Header.Set("Accept", cctpAccept)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Client-ID", c.ClientID.String())
@@ -71,7 +71,7 @@ func (c *Client) NewPostRequestWithCustomCtx(ctx context.Context, url string, da
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", UserAgentAndroid)
+	req.Header.Set("User-Agent", c.currentUA())
 	req.Header.Set("Accept", cctpAccept)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Client-ID", c.ClientID.String())

@@ -370,6 +370,21 @@ body::-webkit-scrollbar{display:none}
             </div>
             <div class="fg"><label>账号</label><input x-model="addForm.username" required placeholder="校园网账号"></div>
             <div class="fg"><label>密码</label><input x-model="addForm.password" type="password" required placeholder="密码"></div>
+            <div class="fg">
+              <label>认证 UA</label>
+              <select x-model="addForm.ua">
+                <option value="">自动（推荐：2104 → 2089 → 2093 回退）</option>
+                <option value="CCTP/android11_64/2104">安卓 2104（新代算法池）</option>
+                <option value="CCTP/android64_vpn/2089">安卓 2089（旧代算法池）</option>
+                <option value="CCTP/Linux64/1003">PC 通道（Linux64/1003）</option>
+                <option value="CCTP/android64_vpn/2093">安卓 2093（最老学校兑底）</option>
+                <option value="custom">自定义…</option>
+              </select>
+              <template x-if="addForm.ua==='custom'">
+                <input x-model="addForm.uaCustom" placeholder="如 CCTP/WinSVR5/1068" style="margin-top:4px">
+              </template>
+              <div class="h">服务器按 UA 家族分派算法池；自动模式被拒时依次回退重试</div>
+            </div>
             <div class="r2">
               <div class="fg"><label>检查间隔 ms</label><input x-model.number="addForm.ci" type="number" min="0"><div class="h">0=默认10s</div></div>
               <div class="fg"><label>重试间隔 ms</label><input x-model.number="addForm.ri" type="number" min="-1"><div class="h">负数=不重试</div></div>
@@ -394,6 +409,21 @@ body::-webkit-scrollbar{display:none}
             <div class="fg"><label>网卡</label><input :value="editingName" readonly></div>
             <div class="fg"><label>账号</label><input x-model="editForm.username" required></div>
             <div class="fg"><label>密码</label><input x-model="editForm.password" type="password" placeholder="留空表示不修改" :required="!find(editingName)?.has_password"></div>
+            <div class="fg">
+              <label>认证 UA</label>
+              <select x-model="editForm.ua">
+                <option value="">自动（推荐：2104 → 2089 → 2093 回退）</option>
+                <option value="CCTP/android11_64/2104">安卓 2104（新代算法池）</option>
+                <option value="CCTP/android64_vpn/2089">安卓 2089（旧代算法池）</option>
+                <option value="CCTP/Linux64/1003">PC 通道（Linux64/1003）</option>
+                <option value="CCTP/android64_vpn/2093">安卓 2093（最老学校兑底）</option>
+                <option value="custom">自定义…</option>
+              </select>
+              <template x-if="editForm.ua==='custom'">
+                <input x-model="editForm.uaCustom" placeholder="如 CCTP/WinSVR5/1068" style="margin-top:4px">
+              </template>
+              <div class="h">修改后需重新认证才生效；服务器按 UA 家族分派算法池</div>
+            </div>
             <div class="r2">
               <div class="fg"><label>检查间隔 ms</label><input x-model.number="editForm.ci" type="number" min="0"></div>
               <div class="fg"><label>重试间隔 ms</label><input x-model.number="editForm.ri" type="number" min="-1"></div>
@@ -455,8 +485,9 @@ function app() {
     busy: {},
     modal: { show: false, type: '', title: '' },
     editingName: '',
-    addForm: { username: '', password: '', ci: 10000, ri: 10000, mr: 5, dns: '', manual_if: '', selectedIf: '' },
-    editForm: { username: '', password: '', ci: 0, ri: 0, mr: 0, dns: '' },
+    addForm: { username: '', password: '', ci: 10000, ri: 10000, mr: 5, dns: '', manual_if: '', selectedIf: '', ua: '', uaCustom: '' },
+    editForm: { username: '', password: '', ci: 0, ri: 0, mr: 0, dns: '', ua: '', uaCustom: '' },
+    uaPresets: ['CCTP/android11_64/2104', 'CCTP/android64_vpn/2089', 'CCTP/Linux64/1003', 'CCTP/android64_vpn/2093'],
     toasts: [],
     _toastId: 0,
     _timer: null,
@@ -540,6 +571,7 @@ function app() {
       var st = this.cardStatus(f);
       rows.push({ label: 'IP', value: f.user_ip || '—', mono: true });
       rows.push({ label: '账号', value: f.username || '—' });
+      rows.push({ label: 'UA', value: f.user_agent || '自动', mono: true });
       rows.push({ label: '上次认证', value: f.last_login ? this.ago(f.last_login) : '—' });
       rows.push({ label: '上次心跳', value: f.last_heartbeat ? this.ago(f.last_heartbeat) : '—' });
       if (st.actualSt === 'online' && f.next_heartbeat) {
@@ -594,10 +626,25 @@ function app() {
     },
 
     openAdd() {
-      this.addForm = { username: '', password: '', ci: 10000, ri: 10000, mr: this.settings.default_max_retries || 5, dns: '', manual_if: '', selectedIf: '' };
+      this.addForm = { username: '', password: '', ci: 10000, ri: 10000, mr: this.settings.default_max_retries || 5, dns: '', manual_if: '', selectedIf: '', ua: '', uaCustom: '' };
       this.loadSysIfs().then(() => {
         this.modal = { show: true, type: 'add', title: '添加网口' };
       });
+    },
+
+    // 表单选择 → 提交值：'' / 'auto' → ''（后端自动链）；'custom' → 自定义输入；预设 → 原值
+    resolveUAPost(ua, custom) {
+      if (ua === 'custom') return (custom || '').trim();
+      if (!ua || ua === 'auto') return '';
+      return ua;
+    },
+
+    // 存储值 → 表单选择：预设反查 select 项，非预设值 → 自定义输入框
+    uaFromStored(v) {
+      v = v || '';
+      if (!v || v === 'auto') return { ua: '', uaCustom: '' };
+      if (this.uaPresets.indexOf(v) >= 0) return { ua: v, uaCustom: '' };
+      return { ua: 'custom', uaCustom: v };
     },
 
     selectIf(name) {
@@ -612,7 +659,8 @@ function app() {
       var d = {
         interface: iface, username: this.addForm.username.trim(), password: this.addForm.password,
         check_interval: this.addForm.ci || 0, retry_interval: this.addForm.ri || 0,
-        max_retries: this.addForm.mr || 0, bind_interface: iface, dns_address: this.addForm.dns.trim()
+        max_retries: this.addForm.mr || 0, bind_interface: iface, dns_address: this.addForm.dns.trim(),
+        user_agent: this.resolveUAPost(this.addForm.ua, this.addForm.uaCustom)
       };
       fetch('/api/interfaces', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) })
         .then(r => { if (!r.ok) throw Error(r.status); return r.json().catch(() => ({})); })
@@ -623,11 +671,13 @@ function app() {
     openEdit(name) {
       var f = this.find(name); if (!f) return;
       this.editingName = name;
+      var u = this.uaFromStored(f.user_agent);
       this.editForm = {
         // 密码不下发到前端，编辑时留空，提交时若为空则后端保留原密码
         username: f.username || '', password: '',
         ci: f.check_interval || 0, ri: f.retry_interval ?? 0,
-        mr: f.max_retries || 0, dns: f.dns_address || ''
+        mr: f.max_retries || 0, dns: f.dns_address || '',
+        ua: u.ua, uaCustom: u.uaCustom
       };
       this.modal = { show: true, type: 'edit', title: '编辑 · ' + name };
     },
@@ -636,7 +686,8 @@ function app() {
       var d = {
         interface: this.editingName, username: this.editForm.username.trim(), password: this.editForm.password,
         check_interval: this.editForm.ci || 0, retry_interval: this.editForm.ri || 0,
-        max_retries: this.editForm.mr || 0, bind_interface: this.editingName, dns_address: this.editForm.dns.trim()
+        max_retries: this.editForm.mr || 0, bind_interface: this.editingName, dns_address: this.editForm.dns.trim(),
+        user_agent: this.resolveUAPost(this.editForm.ua, this.editForm.uaCustom)
       };
       fetch('/api/interfaces/' + this.editingName, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) })
         .then(r => { if (!r.ok) throw Error(r.status); return r.json().catch(() => ({})); })

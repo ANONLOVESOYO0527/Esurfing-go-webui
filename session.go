@@ -25,6 +25,10 @@ type SessionData struct {
 	// 复用它可脱离 DNS（门户地址通常为 IP 直连）
 	RedirectUrl string `json:"redirect_url,omitempty"`
 
+	// UserAgent 登录时使用的 UA：恢复会话必须沿用（心跳/下线报文与登录会话同族，
+	// 避免服务端会话-客户端族不匹配；同时作为后续强制重认证的首选 UA）
+	UserAgent string `json:"user_agent,omitempty"`
+
 	// BindInterface/DnsAddress 认证时的网络配置：
 	// 兜底发送 term 需按原认证路径绑定出接口（多 WAN 场景）
 	BindInterface string `json:"bind_interface,omitempty"`

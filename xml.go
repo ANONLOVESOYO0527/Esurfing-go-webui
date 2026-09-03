@@ -10,10 +10,19 @@ import (
 	"time"
 )
 
-// UserAgentAndroid 模拟安卓客户端的 User-Agent
+// UA 预设表（docs/08 §3.2）。服务端按 UA 家族分派算法池且按会话随机轮换（docs/05 §12）：
+// 同一 URL 仅换 UA 即结果天壤之别（准入闸按版本号逐个拒，docs/05 §12.1）。
+// 本校实测（2026-09-03）：2104/2089/1003 全链路 L3 通过；2093 被 Error-Code 3 拒。
 const (
-	UserAgentAndroid = "CCTP/android64_vpn/2093"
+	UAAndroid2104 = "CCTP/android11_64/2104"  // 主选：新代 9 池（官方 App v4.0.2104 同源）
+	UAAndroid2089 = "CCTP/android64_vpn/2089"  // 回退①：旧代 9 池（本校 + WYU 实测）
+	UAAndroid2093 = "CCTP/android64_vpn/2093"  // 回退②：历史默认，更老的学校兑底
+	UAPCLinux64   = "CCTP/Linux64/1003"        // PC 通道：PC 6 池
+	UserAgentAuto = "auto"                     // 配置值：自动回退链（缺省）
 )
+
+// defaultUAChain 自动模式的回退链：每级都有本校实测落点（docs/05 §12.1）
+var defaultUAChain = []string{UAAndroid2104, UAAndroid2089, UAAndroid2093}
 
 // cstZone 协议要求 local-time 固定使用东八区（设备本地时区可能被配置为 UTC 等）
 var cstZone = time.FixedZone("CST", 8*3600)
@@ -110,7 +119,7 @@ type EConfig struct {
 // GenerateGetTicketXML 生成获取票据的XML请求
 func (c *Client) GenerateGetTicketXML() ([]byte, error) {
 	tr := TicketRequest{
-		UserAgent: UserAgentAndroid,
+		UserAgent: c.currentUA(),
 		ClientID:  c.ClientID.String(),
 		LocalTime: xmlLocalTime(),
 		HostName:  c.Hostname,
@@ -129,7 +138,7 @@ func (c *Client) GenerateGetTicketXML() ([]byte, error) {
 // GenerateStateXML 生成心跳状态XML请求
 func (c *Client) GenerateStateXML() ([]byte, error) {
 	s := &State{
-		UserAgent: UserAgentAndroid,
+		UserAgent: c.currentUA(),
 		ClientID:  c.ClientID.String(),
 		LocalTime: xmlLocalTime(),
 		HostName:  c.Hostname,
@@ -149,7 +158,7 @@ func (c *Client) GenerateStateXML() ([]byte, error) {
 // GenerateLoginXML 生成登录XML请求
 func (c *Client) GenerateLoginXML() ([]byte, error) {
 	lr := &LoginRequest{
-		UserAgent: UserAgentAndroid,
+		UserAgent: c.currentUA(),
 		ClientID:  c.ClientID.String(),
 		Ticket:    c.Ticket,
 		LocalTime: xmlLocalTime(),

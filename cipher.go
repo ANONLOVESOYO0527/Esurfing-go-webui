@@ -584,7 +584,9 @@ var (
 type Zuc struct{}
 
 func (z *Zuc) Encrypt(data []byte) ([]byte, error) {
-	padded := zeroPadding(data, 4) // ZUC works on 32-bit words
+	// 拷贝一份：原地 XOR 不得污染调用方明文（zeroPadding 在已对齐时返回原切片；
+	// 与 debug 工具同源修复，输出字节不变，仅消除别名副作用）
+	padded := append([]byte{}, zeroPadding(data, 4)...)
 	c, err := zuc.NewCipher(zucKey, zucIv)
 	if err != nil {
 		return nil, err

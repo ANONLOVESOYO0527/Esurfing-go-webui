@@ -24,7 +24,7 @@ import (
 //	POST /auth     → 加密登录响应（rejectLogin=true 时返回无 keep-url 的拒绝报文）
 func newAuthFixture(t *testing.T) (*Client, *authFixture) {
 	t.Helper()
-	f := &authFixture{}
+	f := &authFixture{algoID: AlgoXTea}
 
 	loginSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -68,9 +68,33 @@ func newAuthFixture(t *testing.T) (*Client, *authFixture) {
 			// ZSM 握手：body 为 36 字符明文算法 ID
 			if len(body) == 36 {
 				if _, perr := uuid.Parse(string(body)); perr == nil {
-					_, _ = w.Write(buildAlgoIDPayload())
+					ua := r.Header.Get("User-Agent")
+					// 准入闸形态（docs/05 §2）：HTTP 200 + Error-Code ≠ 200 + 空体
+					if ec, bad := f.rejectUAs[ua]; bad {
+						w.Header().Set("Error-Code", ec)
+						w.Header().Set("Server-Tag", "cdcportal/1.4.2/gd-portal-40")
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+					guid := f.algoID
+					if f.algoForUA != nil {
+						if g := f.algoForUA(ua); g != "" {
+							guid = g
+						}
+					}
+					// 真实服务器成功形态带 Error-Code: 200（ZSM 成功码，docs/05 §3.1）
+					if !f.omitZSMErrorCode {
+						w.Header().Set("Error-Code", "200")
+					}
+					_, _ = w.Write(buildAlgoIDPayload(guid))
 					return
 				}
+			}
+			// 加密 GetTicket 报文：解密留档供断言（XML <user-agent> 契约）
+			if pt, derr := f.cipher().Decrypt(body); derr == nil {
+				f.mu.Lock()
+				f.lastTicketPlain = string(pt)
+				f.mu.Unlock()
 			}
 			enc, _ := f.cipher().Encrypt([]byte(`<?xml version="1.0"?><response><ticket>tkt-123</ticket></response>`))
 			_, _ = w.Write(enc)
@@ -123,6 +147,7 @@ type capturedRequest struct {
 	method      string
 	path        string
 	contentType string
+	ua          string
 	schoolID    string
 	domain      string
 	area        string
@@ -135,8 +160,20 @@ type authFixture struct {
 	base        string
 	rejectLogin bool
 
-	mu       sync.Mutex
-	captured []capturedRequest
+	algoID string // ZSM 握手下发的算法 ID（默认 XTEA；24 ID 循环用）
+
+	// rejectUAs 命中表的 UA 在 ZSM 握手被拒（Error-Code 头 + 空体，模拟真实准入闸形态，docs/05 §2）
+	rejectUAs map[string]string // UA → Error-Code
+
+	// algoForUA 可选：按握手 UA 决定下发的 GUID（模拟未知 GUID / 分族算法池）
+	algoForUA func(ua string) string
+
+	// omitZSMErrorCode 为 true 时 ZSM 成功响应不带 Error-Code 头（老门户/mock 兼容形态）
+	omitZSMErrorCode bool
+
+	mu              sync.Mutex
+	captured        []capturedRequest
+	lastTicketPlain string // 最近一次加密 GetTicket 请求的解密明文
 }
 
 func (f *authFixture) record(r *http.Request, body []byte) {
@@ -146,6 +183,7 @@ func (f *authFixture) record(r *http.Request, body []byte) {
 		method:      r.Method,
 		path:        r.URL.Path,
 		contentType: r.Header.Get("Content-Type"),
+		ua:          r.Header.Get("User-Agent"),
 		schoolID:    r.Header.Get("CDC-SchoolId"),
 		domain:      r.Header.Get("CDC-Domain"),
 		area:        r.Header.Get("CDC-Area"),
@@ -190,8 +228,8 @@ func (f *authFixture) ticketURL() string {
 
 func (f *authFixture) authURL() string { return f.base + "/auth" }
 
-// cipher 使用固定算法 ID（XTEA 纯软件实现，无平台差异）
-func (f *authFixture) cipher() Cipher { return NewCipher(AlgoXTea) }
+// cipher 使用当次 ZSM 握手协商的算法 ID（默认 XTEA 纯软件实现，无平台差异）
+func (f *authFixture) cipher() Cipher { return NewCipher(f.algoID) }
 
 func mustUUID() uuid.UUID { return uuid.New() }
 
@@ -203,14 +241,37 @@ func xmlEsc(s string) string {
 
 // buildAlgoIDPayload 构造 ZSM 握手响应的二进制结构：
 // [4字节头 byte[3]=keyLen] [key] ['$'] [36字节算法ID]（分隔符值 0x24 恰为 36）
-func buildAlgoIDPayload() []byte {
-	algoID := []byte(AlgoXTea)
+func buildAlgoIDPayload(algoID string) []byte {
 	key := []byte("testkey")
 	out := []byte{0, 0, 0, byte(len(key))}
 	out = append(out, key...)
 	out = append(out, '$')
 	out = append(out, algoID...)
 	return out
+}
+
+// zsmHandshakes 返回已捕获的 ZSM 握手请求（body 为 36 字符合法 UUID）及其 UA
+func (f *authFixture) zsmHandshakes() []capturedRequest {
+	var out []capturedRequest
+	for _, cr := range f.requestsByPath("/ticket") {
+		if len(cr.body) == 36 {
+			if _, err := uuid.Parse(string(cr.body)); err == nil {
+				out = append(out, cr)
+			}
+		}
+	}
+	return out
+}
+
+// uaCount 统计指定 UA 的 ZSM 握手次数
+func (f *authFixture) uaCount(ua string) int {
+	n := 0
+	for _, cr := range f.zsmHandshakes() {
+		if cr.ua == ua {
+			n++
+		}
+	}
+	return n
 }
 
 // --- 完整认证链路集成测试 ---
@@ -458,7 +519,9 @@ func TestHarvestCDCSupportsHeaderVariants(t *testing.T) {
 func TestSessionRoundTripCarriesNetworkContext(t *testing.T) {
 	_, f := newAuthFixture(t)
 
+	var heartbeatUA string
 	keepSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heartbeatUA = r.Header.Get("User-Agent")
 		enc, _ := NewCipher(AlgoXTea).Encrypt([]byte(`<response><interval>45</interval></response>`))
 		_, _ = w.Write(enc)
 	}))
@@ -477,6 +540,7 @@ func TestSessionRoundTripCarriesNetworkContext(t *testing.T) {
 		TermUrl:       keepSrv.URL + "/term",
 		IndexUrl:      f.econfigURL(),
 		RedirectUrl:   f.nextURL(),
+		UserAgent:     UAAndroid2089,
 		BindInterface: "sys_default",
 		DnsAddress:    "",
 	}
@@ -512,5 +576,204 @@ func TestSessionRoundTripCarriesNetworkContext(t *testing.T) {
 	}
 	if !c.authed.Load() || c.lastHeartbeatInterval != 45 {
 		t.Fatalf("resumed session state wrong: authed=%v interval=%d", c.authed.Load(), c.lastHeartbeatInterval)
+	}
+	// UA 必须随会话持久化并在恢复后沿用（心跳/下线报文与登录会话同族）
+	if loaded.UserAgent != UAAndroid2089 {
+		t.Fatalf("user_agent lost across save/load, got %q", loaded.UserAgent)
+	}
+	if c.currentUA() != UAAndroid2089 {
+		t.Fatalf("resumed client must reuse login ua, got %q", c.currentUA())
+	}
+	if heartbeatUA != UAAndroid2089 {
+		t.Fatalf("heartbeat request must carry login ua, got %q", heartbeatUA)
+	}
+}
+
+// --- 24 算法全链路闭环（mock portal 参数化，Phase D）---
+
+func TestAuthFullFlowAllAlgorithms(t *testing.T) {
+	for _, id := range allRegisteredAlgoIDs() {
+		id := id
+		t.Run(id[:8], func(t *testing.T) {
+			c, f := newAuthFixture(t)
+			f.algoID = id
+
+			if err := c.Auth(f.nextURL()); err != nil {
+				t.Fatalf("auth flow failed with algo %s: %v", id, err)
+			}
+			if c.AlgoID != id {
+				t.Fatalf("negotiated algo %q != mock-served %q", c.AlgoID, id)
+			}
+			if c.Ticket != "tkt-123" {
+				t.Fatalf("expected ticket tkt-123, got %q", c.Ticket)
+			}
+			if !c.authed.Load() {
+				t.Fatal("authed should be true")
+			}
+		})
+	}
+}
+
+// --- UA 回退链：被拒 UA 自动换下一个，成功值记忆且重认证不再重复试探 ---
+
+func TestAuthUAFallbackAndPreferredMemory(t *testing.T) {
+	c, f := newAuthFixture(t)
+	// 模拟本校 09-02 实测形态：2104 被准入闸拒（Error-Code 3），2089 放行
+	f.rejectUAs = map[string]string{UAAndroid2104: "3"}
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("auth should fall back to next ua: %v", err)
+	}
+	if got := c.currentUA(); got != UAAndroid2089 {
+		t.Fatalf("expected fallback to %s, got %q", UAAndroid2089, got)
+	}
+	if !c.authed.Load() {
+		t.Fatal("authed should be true after fallback")
+	}
+	if f.uaCount(UAAndroid2104) != 1 || f.uaCount(UAAndroid2089) != 1 {
+		t.Fatalf("expected exactly one handshake per tried ua, got 2104=%d 2089=%d",
+			f.uaCount(UAAndroid2104), f.uaCount(UAAndroid2089))
+	}
+
+	// 重认证（黑洞自愈路径）：preferredUA 置链首，不得再试探已知被拒的 2104
+	c.authed.Store(false)
+	if err := c.HandleRedirect(nil); err != nil {
+		t.Fatalf("re-auth should reuse preferred ua: %v", err)
+	}
+	if f.uaCount(UAAndroid2104) != 1 {
+		t.Fatalf("preferred ua must not retry known-bad 2104 (handshakes=%d)", f.uaCount(UAAndroid2104))
+	}
+	if f.uaCount(UAAndroid2089) != 2 {
+		t.Fatalf("re-auth should handshake with 2089 again (handshakes=%d)", f.uaCount(UAAndroid2089))
+	}
+}
+
+// --- 链耗尽：错误信息必须列出全部 UA 尝试记录 ---
+
+func TestAuthAllUAsRejected(t *testing.T) {
+	c, f := newAuthFixture(t)
+	f.rejectUAs = map[string]string{
+		UAAndroid2104: "3",
+		UAAndroid2089: "3",
+		UAAndroid2093: "3",
+	}
+
+	err := c.Auth(f.nextURL())
+	if err == nil {
+		t.Fatal("auth must fail when every ua in chain is rejected")
+	}
+	msg := err.Error()
+	for _, ua := range []string{UAAndroid2104, UAAndroid2089, UAAndroid2093} {
+		if !strings.Contains(msg, ua) {
+			t.Fatalf("error should list attempt for %s, got: %s", ua, msg)
+		}
+	}
+	if !strings.Contains(msg, "error_code=3") {
+		t.Fatalf("error should carry error_code diagnostics, got: %s", msg)
+	}
+	if c.authed.Load() {
+		t.Fatal("authed must stay false")
+	}
+}
+
+// --- 未知 GUID：触发回退换下一个 UA（第四代兑底语义）---
+
+func TestAuthUnknownGUIDFallsBack(t *testing.T) {
+	c, f := newAuthFixture(t)
+	unknown := "376412D4-0000-0000-0000-000000000000" // Windows 族未知 GUID（uaprobe 实测形态）
+	f.algoForUA = func(ua string) string {
+		if ua == UAAndroid2104 {
+			return unknown
+		}
+		return "" // 其余 UA → f.algoID（XTEA）
+	}
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("unknown guid should fall back to next ua: %v", err)
+	}
+	if c.AlgoID != AlgoXTea {
+		t.Fatalf("expected fallback to known algo, got %q", c.AlgoID)
+	}
+	if f.uaCount(UAAndroid2104) != 1 {
+		t.Fatalf("2104 should be tried exactly once (handshakes=%d)", f.uaCount(UAAndroid2104))
+	}
+}
+
+// --- ZSM 握手 body 必须每次归零：重认证不得带上次 GUID（Error-Code 1，docs/05 §3.2）---
+
+func TestAuthAlgoIDResetsOnReauth(t *testing.T) {
+	c, f := newAuthFixture(t)
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("initial auth failed: %v", err)
+	}
+	if c.AlgoID != AlgoXTea {
+		t.Fatalf("expected negotiated %q, got %q", AlgoXTea, c.AlgoID)
+	}
+
+	// 强制重认证：第二次 ZSM 握手 body 必须仍是全零 UUID 而非 AlgoXTea
+	c.authed.Store(false)
+	if err := c.HandleRedirect(nil); err != nil {
+		t.Fatalf("re-auth failed: %v", err)
+	}
+
+	handshakes := f.zsmHandshakes()
+	if len(handshakes) != 2 {
+		t.Fatalf("expected 2 zsm handshakes, got %d", len(handshakes))
+	}
+	for i, hs := range handshakes {
+		if string(hs.body) != "00000000-0000-0000-0000-000000000000" {
+			t.Fatalf("zsm handshake #%d body must be zero uuid, got %q", i, string(hs.body))
+		}
+	}
+}
+
+// --- 自选 UA：HTTP 头与 XML <user-agent> 报文体同源 ---
+
+func TestAuthSingleUAContract(t *testing.T) {
+	c, f := newAuthFixture(t)
+	c.Config.UserAgent = UAAndroid2089
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("auth with configured ua failed: %v", err)
+	}
+	if got := c.currentUA(); got != UAAndroid2089 {
+		t.Fatalf("currentUA should be configured value, got %q", got)
+	}
+
+	// 所有捕获的请求（门户 GET + 业务 POST）都必须携带同一 UA
+	reqs := f.requestsByPath("/portal")
+	reqs = append(reqs, f.requestsByPath("/econfig")...)
+	reqs = append(reqs, f.requestsByPath("/ticket")...)
+	reqs = append(reqs, f.requestsByPath("/auth")...)
+	if len(reqs) == 0 {
+		t.Fatal("no captured requests")
+	}
+	for _, r := range reqs {
+		if r.ua != UAAndroid2089 {
+			t.Fatalf("request %s %s carried ua %q, want %q", r.method, r.path, r.ua, UAAndroid2089)
+		}
+	}
+
+	// 加密报文体中的 <user-agent> 字段与 HTTP 头同源
+	f.mu.Lock()
+	plain := f.lastTicketPlain
+	f.mu.Unlock()
+	if !strings.Contains(plain, "<user-agent>"+UAAndroid2089+"</user-agent>") {
+		t.Fatalf("ticket xml user-agent mismatch, body: %s", plain)
+	}
+}
+
+// --- Error-Code 头缺失（mock/老门户形态）必须视为成功 ---
+
+func TestAuthMissingErrorCodeHeaderStillSucceeds(t *testing.T) {
+	c, f := newAuthFixture(t)
+	f.omitZSMErrorCode = true
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("missing Error-Code header must not be treated as rejection: %v", err)
+	}
+	if !c.authed.Load() {
+		t.Fatal("authed should be true")
 	}
 }

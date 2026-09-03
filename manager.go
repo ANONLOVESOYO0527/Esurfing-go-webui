@@ -24,6 +24,7 @@ type ManagedClient struct {
 	Status        string `json:"status"`
 	Username      string `json:"username"`
 	Password      string `json:"password"`
+	UserAgent     string `json:"user_agent"` // 空/auto=自动回退链；预设或自定义 UA
 	CheckInterval int    `json:"check_interval"`
 	RetryInterval int    `json:"retry_interval"`
 	DnsAddress    string `json:"dns_address"`
@@ -49,6 +50,7 @@ type InterfaceView struct {
 	Enabled       bool   `json:"enabled"`
 	Status        string `json:"status"`
 	Username      string `json:"username"`
+	UserAgent     string `json:"user_agent"`
 	CheckInterval int    `json:"check_interval"`
 	RetryInterval int    `json:"retry_interval"`
 	DnsAddress    string `json:"dns_address"`
@@ -85,6 +87,24 @@ func validInterfaceName(name string) bool {
 		// 拒绝 Windows 非法文件名字符，避免 session 文件写入失败
 		switch r {
 		case '<', '>', ':', '"', '|', '?', '*':
+			return false
+		}
+	}
+	return true
+}
+
+// validUserAgent 校验 UA 配置：空/"auto" 合法（自动链）；其他值须 ≤64 字符且不含
+// 控制字符与空白——UA 会进入 HTTP 头与 XML 报文体，控制字符可造成头注入/报文损坏，
+// 超长值可能被门户准入闸拒绝。
+func validUserAgent(ua string) bool {
+	if ua == "" || strings.EqualFold(ua, UserAgentAuto) {
+		return true
+	}
+	if len(ua) > 64 {
+		return false
+	}
+	for _, r := range ua {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
 			return false
 		}
 	}
@@ -235,6 +255,10 @@ func (m *Manager) Load() error {
 		if iface.BindInterface != "" && !validInterfaceName(iface.BindInterface) {
 			return fmt.Errorf("invalid bind_interface name at index %d: %q", i, iface.BindInterface)
 		}
+		// UA 非关键字段：无效值（手改配置文件）回退自动链，不阻塞加载
+		if !validUserAgent(iface.UserAgent) {
+			iface.UserAgent = ""
+		}
 		iface.Status = "disabled"
 		iface.UserIP = ""
 		iface.LastHeartbeat = ""
@@ -272,6 +296,7 @@ func (m *Manager) Save() error {
 			Enabled:       c.Enabled,
 			Username:      c.Username,
 			Password:      c.Password,
+			UserAgent:     c.UserAgent,
 			CheckInterval: c.CheckInterval,
 			RetryInterval: c.RetryInterval,
 			DnsAddress:    c.DnsAddress,
@@ -342,6 +367,7 @@ func (m *Manager) GetAll() []InterfaceView {
 			Enabled:       c.Enabled,
 			Status:        c.Status,
 			Username:      c.Username,
+			UserAgent:     c.UserAgent,
 			CheckInterval: c.CheckInterval,
 			RetryInterval: c.RetryInterval,
 			DnsAddress:    c.DnsAddress,
@@ -380,6 +406,9 @@ func (m *Manager) Add(mc *ManagedClient) error {
 	if mc.RetryInterval < -1 || mc.RetryInterval > 24*3600*1000 {
 		return fmt.Errorf("retry_interval out of range (-1..%d ms)", 24*3600*1000)
 	}
+	if !validUserAgent(mc.UserAgent) {
+		return fmt.Errorf("invalid user_agent: %q (max 64 chars, no whitespace or control characters)", mc.UserAgent)
+	}
 
 	m.mu.Lock()
 	if _, exists := m.clients[mc.Name]; exists {
@@ -415,6 +444,9 @@ func (m *Manager) Update(name string, mc *ManagedClient) error {
 	if mc.RetryInterval < -1 || mc.RetryInterval > 24*3600*1000 {
 		return fmt.Errorf("retry_interval out of range (-1..%d ms)", 24*3600*1000)
 	}
+	if !validUserAgent(mc.UserAgent) {
+		return fmt.Errorf("invalid user_agent: %q (max 64 chars, no whitespace or control characters)", mc.UserAgent)
+	}
 
 	m.mu.Lock()
 	existing, exists := m.clients[name]
@@ -434,6 +466,7 @@ func (m *Manager) Update(name string, mc *ManagedClient) error {
 	if mc.Password != "" {
 		existing.Password = mc.Password
 	}
+	existing.UserAgent = mc.UserAgent
 	existing.CheckInterval = mc.CheckInterval
 	existing.RetryInterval = mc.RetryInterval
 	existing.DnsAddress = mc.DnsAddress
@@ -577,6 +610,7 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 	cfg := &Config{
 		Username:      mc.Username,
 		Password:      mc.Password,
+		UserAgent:     mc.UserAgent,
 		CheckInterval: mc.CheckInterval,
 		RetryInterval: mc.RetryInterval,
 		BindInterface: mc.BindInterface,
@@ -674,6 +708,7 @@ func (m *Manager) startClient(mc *ManagedClient) error {
 			KeepUrl:       client.KeepUrl,
 			TermUrl:       client.TermUrl,
 			IndexUrl:      client.IndexUrl,
+			UserAgent:     client.currentUA(),
 			RedirectUrl:   client.RedirectUrl,
 			BindInterface: mc.BindInterface,
 			DnsAddress:    mc.DnsAddress,
@@ -919,6 +954,8 @@ func (m *Manager) sendTermFromSession(sd *SessionData, name string) bool {
 		AlgoID:     sd.AlgoID,
 		Ticket:     sd.Ticket,
 		TermUrl:    sd.TermUrl,
+		// 沿用登录时的 UA（报文与原会话同族；旧会话无此字段时 currentUA() 兑底默认主选）
+		preferredUA: sd.UserAgent,
 		cipher:     cipher,
 		Log:        log.New(os.Stdout, "[force-logout:"+name+"] ", log.LstdFlags|log.Lmsgprefix),
 	}
