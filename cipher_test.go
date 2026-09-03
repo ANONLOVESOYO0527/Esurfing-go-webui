@@ -247,3 +247,17 @@ func teaBlobEqualsOld(blob []byte, k1, k2, k3 []uint32) bool {
 	}
 	return true
 }
+
+// TestZucEncryptDoesNotMutateInput 回归锚：Zuc.Encrypt 在已对齐输入上不得原地 XOR
+// 污染调用方明文（zeroPadding 对齐时返回原切片；debug 工具同源修复，输出字节不变）
+func TestZucEncryptDoesNotMutateInput(t *testing.T) {
+	pt := []byte("12345678") // 8B 对齐：最易暴露别名 bug 的形态
+	want := append([]byte{}, pt...)
+	z := &Zuc{}
+	if _, err := z.Encrypt(pt); err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if !bytes.Equal(pt, want) {
+		t.Fatalf("Encrypt must not mutate caller's plaintext: got=%x want=%x", pt, want)
+	}
+}

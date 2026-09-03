@@ -24,7 +24,7 @@ import (
 //	POST /auth     → 加密登录响应（rejectLogin=true 时返回无 keep-url 的拒绝报文）
 func newAuthFixture(t *testing.T) (*Client, *authFixture) {
 	t.Helper()
-	f := &authFixture{algoID: AlgoXTea}
+	f := &authFixture{algoID: AlgoXTea, zsmErrorCode: "200"}
 
 	loginSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -82,15 +82,21 @@ func newAuthFixture(t *testing.T) (*Client, *authFixture) {
 							guid = g
 						}
 					}
-					// 真实服务器成功形态带 Error-Code: 200（ZSM 成功码，docs/05 §3.1）
-					if !f.omitZSMErrorCode {
-						w.Header().Set("Error-Code", "200")
+					// 真实服务器成功形态带 Error-Code: 200（ZSM 成功码，docs/05 §3.1）；
+					// zsmErrorCode 可覆盖为其他值或罪空（不发头）以验证判定顺序
+					if f.zsmErrorCode != "" {
+						w.Header().Set("Error-Code", f.zsmErrorCode)
 					}
 					_, _ = w.Write(buildAlgoIDPayload(guid))
 					return
 				}
 			}
 			// 加密 GetTicket 报文：解密留档供断言（XML <user-agent> 契约）
+			if f.failTicket {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("gateway error"))
+				return
+			}
 			if pt, derr := f.cipher().Decrypt(body); derr == nil {
 				f.mu.Lock()
 				f.lastTicketPlain = string(pt)
@@ -168,8 +174,12 @@ type authFixture struct {
 	// algoForUA 可选：按握手 UA 决定下发的 GUID（模拟未知 GUID / 分族算法池）
 	algoForUA func(ua string) string
 
-	// omitZSMErrorCode 为 true 时 ZSM 成功响应不带 Error-Code 头（老门户/mock 兼容形态）
-	omitZSMErrorCode bool
+	// failTicket 为 true 时加密 GetTicket 请求返回 502（T4：GetTicket 失败不触发换 UA）
+	failTicket bool
+
+	// zsmErrorCode ZSM 成功响应的 Error-Code 头值（"" = 不发该头，模拟老门户/mock 形态；
+	// 非 "200" 的任意值用于验证判定顺序不误杀合法 payload）
+	zsmErrorCode string
 
 	mu              sync.Mutex
 	captured        []capturedRequest
@@ -768,7 +778,7 @@ func TestAuthSingleUAContract(t *testing.T) {
 
 func TestAuthMissingErrorCodeHeaderStillSucceeds(t *testing.T) {
 	c, f := newAuthFixture(t)
-	f.omitZSMErrorCode = true
+	f.zsmErrorCode = ""
 
 	if err := c.Auth(f.nextURL()); err != nil {
 		t.Fatalf("missing Error-Code header must not be treated as rejection: %v", err)
@@ -776,4 +786,111 @@ func TestAuthMissingErrorCodeHeaderStillSucceeds(t *testing.T) {
 	if !c.authed.Load() {
 		t.Fatal("authed should be true")
 	}
+}
+
+// --- T1: EC 门控不误杀合法 payload（判定顺序：先解析后看 EC）---
+
+func TestAuthErrorCodeZeroWithValidBodySucceeds(t *testing.T) {
+	c, f := newAuthFixture(t)
+	// 未观测形态防御：某门户 ZSM 成功若沿用业务码 0（或其他值）+ 合法 body，
+	// 必须按 body 解析结果判成功，不得因 EC≠200 误杀（review 发现 1）
+	f.zsmErrorCode = "0"
+
+	if err := c.Auth(f.nextURL()); err != nil {
+		t.Fatalf("valid payload with error_code=0 must not be misclassified: %v", err)
+	}
+	if c.AlgoID != AlgoXTea {
+		t.Fatalf("algo id should be negotiated from body, got %q", c.AlgoID)
+	}
+	if !c.authed.Load() {
+		t.Fatal("authed should be true")
+	}
+}
+
+// --- T3: 网络层错误不触发 UA 回退（换 UA 无意义，直接失败）---
+
+func TestAuthNetworkErrorAbortsChain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close() // 端口立即关闭 → 拨号失败（网络层，非 UA 分流问题）
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{
+		Config:          &Config{Username: "u", Password: "p"},
+		Ctx:             ctx,
+		Cancel:          cancel,
+		HttpClient:      &http.Client{},
+		Log:             nopLogger(),
+		heartBeatTicker: time.NewTicker(time.Duration(math.MaxInt64)),
+	}
+	defer c.heartBeatTicker.Stop()
+
+	err := c.Auth(url)
+	if err == nil {
+		t.Fatal("auth must fail on network error")
+	}
+	if strings.Contains(err.Error(), "all user agents rejected") {
+		t.Fatalf("network error must abort the chain immediately, not exhaust it: %v", err)
+	}
+}
+
+// --- T4: GetTicket 失败不触发换 UA（按 docs/08 §3.3 设计，锁定行为）---
+
+func TestAuthTicketFailureDoesNotFallback(t *testing.T) {
+	c, f := newAuthFixture(t)
+	f.failTicket = true // ZSM 成功后 GetTicket 返回 502
+
+	err := c.Auth(f.nextURL())
+	if err == nil {
+		t.Fatal("auth must fail when get-ticket fails")
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Fatalf("error should carry ticket failure status, got: %v", err)
+	}
+	// 关键断言：链没有推进（只握了一次手，未尝试下一个 UA）
+	if n := len(f.zsmHandshakes()); n != 1 {
+		t.Fatalf("ticket failure must not advance the ua chain (handshakes=%d)", n)
+	}
+}
+
+// --- T6: 旧版会话（无 user_agent 字段）恢复后 currentUA 回退链首（文档化行为）---
+
+func TestSessionResumeWithoutUserAgentUsesChainDefault(t *testing.T) {
+	var heartbeatUA string
+	keepSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heartbeatUA = r.Header.Get("User-Agent")
+		enc, _ := NewCipher(AlgoXTea).Encrypt([]byte(`<response><interval>60</interval></response>`))
+		_, _ = w.Write(enc)
+	}))
+	defer keepSrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{
+		Config:          &Config{Username: "u", Password: "p"},
+		Ctx:             ctx,
+		Cancel:          cancel,
+		HttpClient:      &http.Client{},
+		Log:             nopLogger(),
+		heartBeatTicker: time.NewTicker(time.Duration(math.MaxInt64)),
+	}
+	defer c.heartBeatTicker.Stop()
+	c.resolveUAChain() // 与生产 NewClient 一致
+
+	// 旧版二进制保存的会话没有 UserAgent 字段 → preferredUA 为空 → 心跳用链首（默认主选）
+	sd := &SessionData{
+		ClientID: uuid.NewString(),
+		Hostname: "h", Mac: "02:00:00:00:00:01",
+		UserIP: "10.0.0.1", AcIP: "172.16.0.1",
+		AlgoID: AlgoXTea, Ticket: "tk",
+		KeepUrl: keepSrv.URL, TermUrl: keepSrv.URL,
+	}
+	if !c.TryResume(sd) {
+		t.Fatal("resume should succeed with reachable keep-url")
+	}
+	if heartbeatUA != UAAndroid2104 {
+		t.Fatalf("old session without user_agent must fall back to chain head, got %q", heartbeatUA)
+	}
+	// 服务端若按会话校验 UA 族，此心跳会被拒 → DeleteSession → 自动重认证（自愈路径）
 }

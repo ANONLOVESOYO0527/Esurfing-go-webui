@@ -168,6 +168,11 @@ func (c *Client) currentUA() string {
 func (c *Client) resolveUAChain() {
 	configured := strings.TrimSpace(c.Config.UserAgent)
 	auto := configured == "" || strings.EqualFold(configured, UserAgentAuto)
+	if !auto && !validUserAgent(configured) {
+		// 与 manager 层校验保持一致：非法配置值（含带空白的 " auto " 等边界）回退自动链，
+		// 防御直接构造 Config 的路径（Add/Update 在入口层已拒绝非法值）
+		auto = true
+	}
 
 	var chain []string
 	if auto {

@@ -460,6 +460,7 @@ func (m *Manager) Update(name string, mc *ManagedClient) error {
 	if wasRunning {
 		existing.stopClient()
 	}
+	oldUsername, oldUserAgent := existing.Username, existing.UserAgent
 
 	existing.Username = mc.Username
 	// 密码为空时保留原密码（前端编辑时不下发密码，留空表示不改）
@@ -473,6 +474,12 @@ func (m *Manager) Update(name string, mc *ManagedClient) error {
 	existing.MaxRetries = mc.MaxRetries
 	existing.BindInterface = mc.BindInterface
 	existing.mu.Unlock()
+
+	// UA 或账号变更后，已存会话不再匹配新配置：TryResume 会用旧 ticket 复活旧族会话
+	// （心跳维持的服务器会话可存活数小时），使 UA 切换被静默搁置——删除会话强制重认证
+	if oldUserAgent != mc.UserAgent || oldUsername != mc.Username {
+		DeleteSession(m.sessionsDir, name)
+	}
 	m.mu.Unlock()
 
 	if err := m.Save(); err != nil {

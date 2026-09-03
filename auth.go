@@ -38,7 +38,6 @@ func isUAFallbackError(err error) bool {
 // 回退触发条件（实测语义见 docs/05 §3.3、§12）：门户页不可用 / ZSM 被拒 /
 // ZSM 空体或不可解析 / 未知 GUID（第四代兑底）；链耗尽时列出全部尝试记录。
 func (c *Client) Auth(URL string) error {
-	log := c.Log
 	if URL != "" {
 		c.RedirectUrl = URL
 	}
@@ -75,15 +74,16 @@ func (c *Client) Auth(URL string) error {
 
 		c.cipher = NewCipher(c.AlgoID)
 		if c.cipher == nil {
+			// AlgoID 为服务端可控字节，过 sanitize 防日志伪造
 			err := fmt.Errorf("%w: %s（不在已知 24 个算法 ID 内，可能是新代际，可反馈该 GUID）",
-				errUnknownAlgoID, c.AlgoID)
+				errUnknownAlgoID, sanitizeSnippet([]byte(c.AlgoID), 36))
 			attempts = append(attempts, fmt.Sprintf("ua=%s: %v", ua, err))
 			c.logf("warn", "%v", err)
 			continue
 		}
 
-		log.Println("user-agent:", ua)
-		log.Println("algo_id:", c.AlgoID)
+		c.logln("info", "user-agent: "+ua)
+		c.logln("info", "algo_id: "+sanitizeSnippet([]byte(c.AlgoID), 36))
 
 		// 链内成功：记忆本 UA（SessionData 持久化由 manager 回调完成），
 		// 后续 ticket/login/心跳/term 全程沿用
@@ -93,7 +93,7 @@ func (c *Client) Auth(URL string) error {
 			return err
 		}
 
-		log.Println("ticket:", c.Ticket)
+		c.logln("info", "ticket: "+sanitizeSnippet([]byte(c.Ticket), 64))
 
 		time.Sleep(time.Millisecond * 333)
 
@@ -270,14 +270,16 @@ func (c *Client) GetAlgoId() error {
 		return fmt.Errorf("zsm handshake http %d: %s", response.StatusCode, sanitizeSnippet(algoIdData, 60))
 	}
 
-	// ZSM 诊断（docs/08 §4）：门户拒绝 UA 时的实测形态 = HTTP 200 + Error-Code ≠ 200 + 空 body
-	//（语义：3=UA 准入拒绝、1=请求无效、200=ZSM 成功码，docs/05 §3.3）。
+	// ZSM 判定顺序（与 L3 参照实现 debug 工具一致）：**先解析 body，解析成功即成功**，
+	// Error-Code 仅在响应不可用时作为诊断信息——避免未观测的“合法 payload + EC≠200”
+	// 形态被误杀（如某门户 ZSM 成功沿用业务码 0）；实测拒绝形态（HTTP 200 +
+	// EC=3 + 空体，docs/05 §2）落入空体分支。
 	// ⚠️ Error-Code 头**缺失**视为成功：mock 环境与部分老门户不下发该头（docs/08 §3.3 兼容规则）。
-	if ec := response.Header.Get("Error-Code"); ec != "" && ec != "200" {
-		return fmt.Errorf("%w: ua=%s error_code=%s sub_error=%q server=%q",
-			errZSMRejected, c.currentUA(), ec, response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"))
-	}
 	if len(algoIdData) == 0 {
+		if ec := response.Header.Get("Error-Code"); ec != "" && ec != "200" {
+			return fmt.Errorf("%w: ua=%s error_code=%s sub_error=%q server=%q",
+				errZSMRejected, c.currentUA(), ec, response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"))
+		}
 		return fmt.Errorf("%w: ua=%s error_code=%q sub_error=%q server=%q (0 bytes)",
 			errZSMEmptyBody, c.currentUA(),
 			response.Header.Get("Error-Code"), response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"))
@@ -285,8 +287,10 @@ func (c *Client) GetAlgoId() error {
 
 	c.AlgoID, _, err = DecodeAlgoID(algoIdData)
 	if err != nil {
-		return fmt.Errorf("%w: ua=%s: %v (zsm head: %s)",
-			errZSMUnparseable, c.currentUA(), err, sanitizeSnippet(algoIdData, 64))
+		return fmt.Errorf("%w: ua=%s error_code=%q sub_error=%q server=%q: %v (zsm head: %s)",
+			errZSMUnparseable, c.currentUA(),
+			response.Header.Get("Error-Code"), response.Header.Get("Sub-Error"), response.Header.Get("Server-Tag"),
+			err, sanitizeSnippet(algoIdData, 64))
 	}
 
 	return nil
