@@ -138,7 +138,7 @@ func GenerateRandomMAC() string {
 //	[4 字节头，其中 byte[3]=keyLen] [keyLen 字节 key] [1 字节分隔符 '$'] [36 字节 UUID = Algo-ID] ...
 //
 // key 仅作透传（真正加解密用本地固定密钥表）；若把分隔符字节当长度读会碰巧工作
-//（'$'=0x24=36 恰好等于 UUID 长度），但语义错误，此处按官方格式固定读取。
+// （'$'=0x24=36 恰好等于 UUID 长度），但语义错误，此处按官方格式固定读取。
 func DecodeAlgoID(data []byte) (algoID string, key string, err error) {
 	dataLen := len(data)
 	if dataLen < 4 {
@@ -288,11 +288,6 @@ func GetResolver(c *Config, localIP net.IP) *net.Resolver {
 		return net.DefaultResolver
 	}
 
-	var udpAddr *net.UDPAddr
-	if localIP != nil {
-		udpAddr = &net.UDPAddr{IP: localIP}
-	}
-
 	// 仅当绑定了真实网卡时才锁定设备；sys_default/空 表示用系统默认路由，不锁定
 	var control func(network, address string, c syscall.RawConn) error
 	if c.BindInterface != "" && c.BindInterface != "sys_default" {
@@ -302,13 +297,21 @@ func GetResolver(c *Config, localIP net.IP) *net.Resolver {
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{
-				Timeout:   5 * time.Second,
-				LocalAddr: udpAddr,
+				Timeout: 5 * time.Second,
+			}
+			// Resolver 在 UDP 响应被截断时会要求 TCP。协议与源地址类型
+			// 必须一起切换，否则较大的 DNS 响应无法完成解析。
+			if localIP != nil {
+				if strings.HasPrefix(network, "tcp") {
+					d.LocalAddr = &net.TCPAddr{IP: localIP}
+				} else {
+					d.LocalAddr = &net.UDPAddr{IP: localIP}
+				}
 			}
 			if control != nil {
 				d.Control = control
 			}
-			return d.DialContext(ctx, "udp", c.DnsAddress)
+			return d.DialContext(ctx, network, c.DnsAddress)
 		},
 	}
 }
