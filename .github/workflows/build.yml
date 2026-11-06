@@ -1,7 +1,6 @@
 name: build
 on:
-  # Router preview assets are built and verified before publication.
-  # Keep the legacy multi-platform builder manual to avoid overwriting them.
+  # Build artifacts first; publication and combined checksums are verified separately.
   workflow_dispatch:
     inputs:
       version:
@@ -66,10 +65,10 @@ jobs:
             opkg_arch: mipsel_24kc
           - GOOS: linux
             GOARCH: mips64
-            ENV: GOMIPS=softfloat
+            ENV: GOMIPS64=softfloat
           - GOOS: linux
             GOARCH: mips64le
-            ENV: GOMIPS=softfloat
+            ENV: GOMIPS64=softfloat
           - GOOS: linux
             GOARCH: riscv64
 
@@ -95,7 +94,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.3'
-          check-latest: true
+          check-latest: false
+
+      - name: Test and Vet Application
+        if: ${{ matrix.GOOS == 'linux' && matrix.GOARCH == 'amd64' }}
+        run: |
+          go test ./...
+          go vet ./...
+          python3 -m unittest discover -s packaging -p 'test_*.py' -v
 
       - name: Prepare Build Environment
         run: mkdir -p dist
@@ -175,25 +181,27 @@ jobs:
           mkdir -p "${IPK_DIR}/data/usr/bin"
           mkdir -p "${IPK_DIR}/data/etc/esurfing-webui"
           mkdir -p "${IPK_DIR}/data/etc/init.d"
+          mkdir -p "${IPK_DIR}/data/usr/share/licenses/esurfing-go-webui"
           mkdir -p "${IPK_DIR}/control"
 
           cp "dist/esurfing-go-webui-${VERSION}-linux-${{ matrix.GOARCH }}" "${IPK_DIR}/data/usr/bin/esurfing-go-webui"
           chmod 755 "${IPK_DIR}/data/usr/bin/esurfing-go-webui"
           cp "packaging/opkg/esurfing-go-webui" "${IPK_DIR}/data/etc/init.d/esurfing-go-webui"
           chmod 755 "${IPK_DIR}/data/etc/init.d/esurfing-go-webui"
+          cp LICENSE "${IPK_DIR}/data/usr/share/licenses/esurfing-go-webui/LICENSE"
 
-          INSTALLED_SIZE=$(du -sk "${IPK_DIR}/data" | cut -f1)
+          printf 'Package: esurfing-go-webui\nVersion: %s\nDepends: libc\nSource: github.com/ANONLOVESOYO0527/Esurfing-go-webui\nSection: net\nArchitecture: %s\nMaintainer: Esurfing-go-webui contributors\nLicense: Apache-2.0\nDescription: Esurfing campus network authentication client with web UI\nInstalled-Size: 0\n' "${VERSION}" "${ARCH}" > "${IPK_DIR}/control/control"
 
-          printf 'Package: esurfing-go-webui\nVersion: %s\nDepends: libc\nSource: github.com/DreamwareN/Esurfing-go-webui\nSection: net\nArchitecture: %s\nMaintainer: DreamwareN\nDescription: Esurfing campus network authentication client with web UI\nInstalled-Size: %s\n' "${VERSION}" "all" "${INSTALLED_SIZE}" > "${IPK_DIR}/control/control"
-
-          printf '#!/bin/sh\n/etc/init.d/esurfing-go-webui enable\n/etc/init.d/esurfing-go-webui start\n' > "${IPK_DIR}/control/postinst"
+          printf '#!/bin/sh\n[ -z "$IPKG_INSTROOT" ] || exit 0\n/etc/init.d/esurfing-go-webui enable\n/etc/init.d/esurfing-go-webui restart\n' > "${IPK_DIR}/control/postinst"
           chmod 755 "${IPK_DIR}/control/postinst"
 
-          printf '#!/bin/sh\n/etc/init.d/esurfing-go-webui stop\n/etc/init.d/esurfing-go-webui disable\n' > "${IPK_DIR}/control/prerm"
+          printf '#!/bin/sh\n[ -z "$IPKG_INSTROOT" ] || exit 0\n/etc/init.d/esurfing-go-webui stop\nif [ "$1" = remove ]; then /etc/init.d/esurfing-go-webui disable; fi\n' > "${IPK_DIR}/control/prerm"
           chmod 755 "${IPK_DIR}/control/prerm"
 
           cd "${IPK_DIR}/data"
           tar -czf "${WORK_DIR}/data.tar.gz" --format=gnu --owner=0 --group=0 --transform='s,^\./,,' -C . .
+          INSTALLED_SIZE=$(stat -c '%s' "${WORK_DIR}/data.tar.gz")
+          sed -i "s/^Installed-Size: .*/Installed-Size: ${INSTALLED_SIZE}/" "${WORK_DIR}/${IPK_DIR}/control/control"
           cd "${WORK_DIR}/${IPK_DIR}/control"
           tar -czf "${WORK_DIR}/control.tar.gz" --format=gnu --owner=0 --group=0 control postinst prerm
           cd "${WORK_DIR}"
