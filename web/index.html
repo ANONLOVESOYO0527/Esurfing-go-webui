@@ -562,6 +562,7 @@ function app() {
       else if (f.enabled && !f.username) { dotClass = 'unconfig'; label = '未配置'; }
       else if (actualSt === 'online') { dotClass = 'online'; label = '在线'; }
       else if (actualSt === 'auth') { dotClass = 'auth'; label = '认证中'; }
+      else if (actualSt === 'degraded') { dotClass = 'auth'; label = '检测异常'; }
       else { dotClass = 'offline'; label = '离线'; }
       return { actualSt, dotClass, label };
     },

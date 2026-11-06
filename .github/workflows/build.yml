@@ -1,7 +1,7 @@
 name: build
 on:
-  release:
-    types: [created]
+  # Router preview assets are built and verified before publication.
+  # Keep the legacy multi-platform builder manual to avoid overwriting them.
   workflow_dispatch:
     inputs:
       version:
@@ -221,11 +221,11 @@ jobs:
           path: dist/*.ipk
 
   release:
-    name: Create Release
+    name: Collect Build Checksums
     needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
@@ -238,11 +238,8 @@ jobs:
           find . -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.ipk' -o -name 'esurfing-go-webui-*' \) \
             -exec sha256sum {} \; > SHA256SUMS.txt
 
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag'
+      - name: Save Checksums as Build Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: build-checksums
+          path: dist/SHA256SUMS.txt

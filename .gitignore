@@ -37,6 +37,8 @@ esurfing_data/
 
 # Local build artifacts
 build/
+dist/
+__pycache__/
 
 # Stray Windows NUL device redirect file
 nul

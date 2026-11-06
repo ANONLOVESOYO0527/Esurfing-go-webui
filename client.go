@@ -22,13 +22,13 @@ import (
 
 // Client 天翼校园网认证客户端
 type Client struct {
-	Config          *Config
-	Log             *log.Logger
-	HttpClient      *http.Client
-	Ctx             context.Context
-	Cancel          context.CancelFunc
-	cipher          Cipher
-	heartBeatTicker *time.Ticker
+	Config                *Config
+	Log                   *log.Logger
+	HttpClient            *http.Client
+	Ctx                   context.Context
+	Cancel                context.CancelFunc
+	cipher                Cipher
+	heartBeatTicker       *time.Ticker
 	lastHeartbeatInterval int
 
 	UserIP     string
@@ -60,6 +60,7 @@ type Client struct {
 	OnHeartbeat    func(interval int)
 	OnBeforeAuth   func()
 	OnLog          func(level, msg string)
+	LogEnabled     func(level string) bool // nil keeps the unfiltered client logger behavior
 
 	authed       atomic.Bool // 认证成功后置位；Logout 据此决定是否发送 term
 	lastAuthFail time.Time
@@ -90,13 +91,20 @@ type Client struct {
 }
 
 func (c *Client) logf(level, format string, v ...interface{}) {
-	c.Log.Printf("["+level+"] "+format, v...)
+	if c.LogEnabled != nil && !c.LogEnabled(level) {
+		return
+	}
+	msg := fmt.Sprintf(format, v...)
+	c.Log.Printf("[%s] %s", level, msg)
 	if c.OnLog != nil {
-		c.OnLog(level, fmt.Sprintf(format, v...))
+		c.OnLog(level, msg)
 	}
 }
 
 func (c *Client) logln(level, msg string) {
+	if c.LogEnabled != nil && !c.LogEnabled(level) {
+		return
+	}
 	c.Log.Println("[" + level + "] " + msg)
 	if c.OnLog != nil {
 		c.OnLog(level, msg)
@@ -134,6 +142,7 @@ const fallbackProbeTimeout = 4 * time.Second
 //     超时；IP 直连可区分「会话失效（被 BRAS 劫持 302）」「仅 DNS 受损（有响应）」
 //     「真黑洞（全部超时）」三种状态，避免把可恢复状态误判成黑洞反复重认证；
 //  2. discoverRedirectEntry：探针被劫持时 302 的 Location 即门户入口。
+//
 // 候选为国内公共 DNS 的 HTTP 端点（实测稳定响应 404，延迟 <50ms）。
 var fallbackProbeURLs = []string{
 	"http://223.5.5.5/",
@@ -176,6 +185,7 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 		Ctx:    ctx,
 		Cancel: cancel,
 		HttpClient: &http.Client{
+			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -293,15 +303,18 @@ func (c *Client) authBackoff() time.Duration {
 	return base << uint(shift)
 }
 
-
 // Start 启动客户端主循环，定期检测网络状态并发送心跳
 func (c *Client) Start() {
 	c.logln("info", "client start")
+	defer c.HttpClient.CloseIdleConnections()
 	defer c.heartBeatTicker.Stop()
 	defer c.Logout()
 
 	if err := c.CheckNetwork(); err != nil {
 		c.logf("warn", "network check failed: %v", err)
+		if c.OnStatusChange != nil {
+			c.OnStatusChange("degraded")
+		}
 		// 首次探测失败同样计入黑洞判定：enable-during-blackhole 场景下
 		// 不应白白丢弃这一次失败信号，否则阈值判定被推迟一个检查周期
 		c.consecutiveCheckFailures++
@@ -325,6 +338,9 @@ func (c *Client) Start() {
 			}
 			checkErr := c.CheckNetwork()
 			if checkErr != nil {
+				if c.OnStatusChange != nil {
+					c.OnStatusChange("degraded")
+				}
 				c.consecutiveCheckFailures++
 				c.logf("warn", "network check failed (%d consecutive): %v", c.consecutiveCheckFailures, checkErr)
 				// 黑洞自愈：连续多次探测异常（超时/DNS失败/非204状态码）时，

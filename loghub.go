@@ -48,6 +48,7 @@ type LogHub struct {
 	fileMu      sync.Mutex
 	closed      bool // Close() 已执行，禁止文件写入
 	entries     []LogEntry
+	oldest      int // index of the oldest entry once the history is full
 	subs        map[chan LogEntry]struct{}
 	maxSize     int
 	logDir      string
@@ -64,7 +65,7 @@ func NewLogHub(maxSize int, logDir string) *LogHub {
 		subs:        make(map[chan LogEntry]struct{}),
 		maxSize:     maxSize,
 		logDir:      logDir,
-		maxFileSize: 1 * 1024 * 1024, // 1MB
+		maxFileSize: 128 * 1024, // Router profile: roughly 384 KiB across three files.
 	}
 	if logDir != "" {
 		h.initLogFile()
@@ -78,13 +79,14 @@ func (h *LogHub) initLogFile() {
 		fmt.Fprintf(os.Stderr, "[loghub] failed to create log dir: %v\n", err)
 		return
 	}
-	h.cleanupOldLogs()
-	h.openNewFile()
+	if h.openNewFile() {
+		h.cleanupOldLogs()
+	}
 }
 
 // openNewFile 以当前时间命名打开新日志文件，成功返回 true
 func (h *LogHub) openNewFile() bool {
-	name := time.Now().Format("2006-01-02_15-04-05.000") + ".json"
+	name := time.Now().Format("2006-01-02_15-04-05.000000000") + ".json"
 	path := filepath.Join(h.logDir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -114,34 +116,44 @@ func (h *LogHub) cleanupOldLogs() {
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Name() > files[j].Name()
 	})
-	if len(files) > 3 {
-		for _, f := range files[3:] {
-			if err := os.Remove(filepath.Join(h.logDir, f.Name())); err != nil {
-				fmt.Fprintf(os.Stderr, "[loghub] failed to remove old log %s: %v\n", f.Name(), err)
-			}
+	current := ""
+	keepOthers := 3
+	if h.logFile != nil {
+		current = filepath.Base(h.logFile.Name())
+		keepOthers = 2
+	}
+	kept := 0
+	for _, f := range files {
+		if f.Name() == current {
+			continue
+		}
+		if kept < keepOthers {
+			kept++
+			continue
+		}
+		if err := os.Remove(filepath.Join(h.logDir, f.Name())); err != nil {
+			fmt.Fprintf(os.Stderr, "[loghub] failed to remove old log %s: %v\n", f.Name(), err)
 		}
 	}
 }
 
 // Add 添加日志并通知所有订阅者，同时持久化到文件
 func (h *LogHub) Add(level, msg string) {
-	entry := LogEntry{
-		Timestamp: time.Now().Format(time.RFC3339),
-		Level:     level,
-		Message:   msg,
-	}
-
 	h.mu.Lock()
 	if levelPriority(level) < h.minLevel {
 		h.mu.Unlock()
 		return
 	}
-	h.entries = append(h.entries, entry)
-	if len(h.entries) > h.maxSize {
-		// copy 到新切片，避免 reslice 后旧底层数组前段无法被 GC
-		kept := make([]LogEntry, h.maxSize)
-		copy(kept, h.entries[len(h.entries)-h.maxSize:])
-		h.entries = kept
+	entry := LogEntry{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Level:     level,
+		Message:   msg,
+	}
+	if len(h.entries) < h.maxSize {
+		h.entries = append(h.entries, entry)
+	} else if h.maxSize > 0 {
+		h.entries[h.oldest] = entry
+		h.oldest = (h.oldest + 1) % h.maxSize
 	}
 	for ch := range h.subs {
 		select {
@@ -161,6 +173,13 @@ func (h *LogHub) SetLevel(level string) {
 	h.mu.Lock()
 	h.minLevel = levelPriority(level)
 	h.mu.Unlock()
+}
+
+// Enabled allows producers to skip formatting disabled log messages.
+func (h *LogHub) Enabled(level string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return levelPriority(level) >= h.minLevel
 }
 
 // writeToFile 将日志条目写入文件，超过大小限制时轮转
@@ -197,12 +216,12 @@ func (h *LogHub) writeToFile(entry LogEntry) {
 	if h.logSize >= h.maxFileSize {
 		oldFile := h.logFile
 		h.logFile = nil
-		h.cleanupOldLogs()
 		if !h.openNewFile() {
 			// 轮转失败，继续使用旧文件
 			h.logFile = oldFile
 		} else if oldFile != nil {
 			oldFile.Close()
+			h.cleanupOldLogs()
 		}
 	}
 }
@@ -231,7 +250,8 @@ func (h *LogHub) GetAll() []LogEntry {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	result := make([]LogEntry, len(h.entries))
-	copy(result, h.entries)
+	n := copy(result, h.entries[h.oldest:])
+	copy(result[n:], h.entries[:h.oldest])
 	return result
 }
 

@@ -1,5 +1,7 @@
 # Esurfing-go-webui
 
+> 本分支包含 **26.11.6.1 路由器优化验证版**。下载、安装和已知限制见 [发布说明](RELEASE_NOTES.md)。网页每 15 秒刷新和校园网心跳规则保留；当前仅小米 4C / OpenWrt 23.05.3 已实测。火绒对上游原版的告警仍无误报结论，详见发布说明。
+
 > 基于 [DreamwareN/Esurfing-go](https://github.com/DreamwareN/Esurfing-go) 的带 Web 管理界面的天翼校园网认证客户端
 
 ## 简介
