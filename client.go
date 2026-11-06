@@ -20,13 +20,13 @@ import (
 
 // Client 天翼校园网认证客户端
 type Client struct {
-	Config          *Config
-	Log             *log.Logger
-	HttpClient      *http.Client
-	Ctx             context.Context
-	Cancel          context.CancelFunc
-	cipher          Cipher
-	heartBeatTicker *time.Ticker
+	Config                *Config
+	Log                   *log.Logger
+	HttpClient            *http.Client
+	Ctx                   context.Context
+	Cancel                context.CancelFunc
+	cipher                Cipher
+	heartBeatTicker       *time.Ticker
 	lastHeartbeatInterval int
 
 	UserIP     string
@@ -56,11 +56,10 @@ type Client struct {
 	authed       atomic.Bool // 认证成功后置位；Logout 据此决定是否发送 term
 	lastAuthFail time.Time
 
-	// consecutiveCheckFailures 连续网络检查异常计数（请求失败或非 204/302 状态码）。
-	// 达到 blackholeReauthThreshold 后主动发起重认证，突破“只有 302 才重新认证”
-	// 的单一恢复路径：多 WAN 负载均衡下报文选路不对称、上游 uRPF 丢弃等场景
-	// 会造成黑洞（无响应、无重定向），旧逻辑此时会永久卡死。
-	consecutiveCheckFailures int
+	// 公网探测与校园网心跳分别计数：探测站故障不等于会话失效，
+	// 公网仍可访问也不能证明心跳正常。
+	consecutiveCheckFailures     int
+	consecutiveHeartbeatFailures int
 }
 
 func (c *Client) logf(level, format string, v ...interface{}) {
@@ -80,9 +79,12 @@ func (c *Client) logln(level, msg string) {
 // RetryIntervalNever 表示不自动重试认证（约定值，任意负数等效）
 const RetryIntervalNever = -1
 
-// blackholeReauthThreshold 连续网络检查异常达到此次数后触发主动重认证。
-// 取 3：默认 10s 检查间隔下约 30s 判定网络黑洞，远小于会话超时，误判代价低。
+// blackholeReauthThreshold 连续异常达到此次数后检查会话或触发恢复。
+// 已认证客户端的公网探测异常须先通过校园网心跳确认。
 const blackholeReauthThreshold = 3
+
+const networkCheckTimeout = 5 * time.Second
+const authRequestTimeout = 20 * time.Second
 
 // NewClient 创建认证客户端，使用外部提供的 ctx/cancel
 func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (*Client, error) {
@@ -120,6 +122,9 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 		Ctx:    ctx,
 		Cancel: cancel,
 		HttpClient: &http.Client{
+			// 包括响应体读取：Transport 的 ResponseHeaderTimeout 只限制响应头，
+			// 无法防止已回响应头但响应体卡住，进而阻塞后续心跳。
+			Timeout: authRequestTimeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -142,6 +147,7 @@ func NewClient(config *Config, ctx context.Context, cancel context.CancelFunc) (
 func (c *Client) Start() {
 	c.logln("info", "client start")
 	defer c.heartBeatTicker.Stop()
+	defer c.HttpClient.CloseIdleConnections()
 	defer c.Logout()
 
 	if err := c.CheckNetwork(); err != nil {
@@ -168,11 +174,26 @@ func (c *Client) Start() {
 			if checkErr != nil {
 				c.consecutiveCheckFailures++
 				c.logf("warn", "network check failed (%d consecutive): %v", c.consecutiveCheckFailures, checkErr)
-				// 黑洞自愈：连续多次探测异常（超时/DNS失败/非204状态码）时，
-				// 会话很可能已死且拿不到 302 重定向，主动重新认证。
+				// 单个公网探测站可能独立故障。已有会话时先验证心跳，
+				// 避免无谓更换 ClientID/MAC、打断正在使用的网络。
 				if c.consecutiveCheckFailures >= blackholeReauthThreshold {
+					if c.authed.Load() {
+						if err := c.SendHeartbeat(); err == nil {
+							c.consecutiveCheckFailures = 0
+							c.heartbeatSucceeded()
+							c.logln("warn", "public probe failed but campus heartbeat is healthy; keeping session")
+							continue
+						} else {
+							c.logf("warn", "campus heartbeat confirmation failed: %v", err)
+						}
+					}
+					if c.Ctx.Err() != nil {
+						return
+					}
 					c.logln("warn", "network unreachable repeatedly, forcing re-auth")
 					c.consecutiveCheckFailures = 0
+					c.consecutiveHeartbeatFailures = 0
+					c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
 					c.HandleRedirect(nil)
 				}
 			} else {
@@ -182,28 +203,37 @@ func (c *Client) Start() {
 			err := c.SendHeartbeat()
 			if err != nil {
 				c.logf("warn", "send heartbeat error: %v", err)
-				c.consecutiveCheckFailures++
-				c.logf("warn", "heartbeat failed (%d consecutive)", c.consecutiveCheckFailures)
+				c.consecutiveHeartbeatFailures++
+				c.logf("warn", "heartbeat failed (%d consecutive)", c.consecutiveHeartbeatFailures)
 				// 心跳连续失败同样说明会话疑似已死：达到阈值时停发心跳并强制重认证。
-				if c.consecutiveCheckFailures >= blackholeReauthThreshold {
+				if c.consecutiveHeartbeatFailures >= blackholeReauthThreshold {
+					if c.Ctx.Err() != nil {
+						return
+					}
 					c.logln("warn", "heartbeat failed repeatedly, forcing re-auth")
 					c.consecutiveCheckFailures = 0
+					c.consecutiveHeartbeatFailures = 0
 					c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))
 					c.HandleRedirect(nil)
 				} else if err := c.CheckNetwork(); err != nil {
 					c.logf("warn", "network recheck failed: %v", err)
 				}
 			} else {
-				c.consecutiveCheckFailures = 0
+				c.heartbeatSucceeded()
 				c.logln("debug", "send heartbeat")
-				if c.OnStatusChange != nil {
-					c.OnStatusChange("online")
-				}
-				if c.OnHeartbeat != nil {
-					c.OnHeartbeat(c.lastHeartbeatInterval)
-				}
 			}
 		}
+	}
+}
+
+// heartbeatSucceeded 统一记录定时心跳和故障确认心跳的成功结果。
+func (c *Client) heartbeatSucceeded() {
+	c.consecutiveHeartbeatFailures = 0
+	if c.OnStatusChange != nil {
+		c.OnStatusChange("online")
+	}
+	if c.OnHeartbeat != nil {
+		c.OnHeartbeat(c.lastHeartbeatInterval)
 	}
 }
 
@@ -266,6 +296,10 @@ func (c *Client) CheckNetwork() error {
 	if err != nil {
 		return err
 	}
+	// 探测与心跳在同一循环执行，公网探测必须尽快让出执行机会。
+	ctx, cancel := context.WithTimeout(c.Ctx, networkCheckTimeout)
+	defer cancel()
+	request = request.WithContext(ctx)
 
 	resp, err := c.HttpClient.Do(request)
 	if err != nil {
@@ -290,6 +324,7 @@ func (c *Client) CheckNetwork() error {
 
 	case http.StatusFound:
 		c.consecutiveCheckFailures = 0
+		c.consecutiveHeartbeatFailures = 0
 		// 探测重定向响应本身也可能携带路由头，先采集再进入认证链
 		c.harvestCDC(resp)
 		c.heartBeatTicker.Reset(time.Duration(math.MaxInt64))

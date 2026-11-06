@@ -119,23 +119,23 @@ type Settings struct {
 	DefaultMaxRetries int    `json:"default_max_retries"`
 	AccessMode        string `json:"access_mode"`
 	AuthCooldown      int    `json:"auth_cooldown"` // 认证冷却时间（秒），默认5，范围1-600
-	LogLevel          string `json:"log_level"`    // 日志最低等级: debug, info, warn, error
+	LogLevel          string `json:"log_level"`     // 日志最低等级: debug, info, warn, error
 }
 
 // Manager 客户端管理器，负责配置持久化和多客户端生命周期管理
 type Manager struct {
-	mu         sync.RWMutex
-	clients    map[string]*ManagedClient
-	settings   Settings
-	configPath string
+	mu          sync.RWMutex
+	clients     map[string]*ManagedClient
+	settings    Settings
+	configPath  string
 	sessionsDir string
-	logHub     *LogHub
+	logHub      *LogHub
 
-	authMu       sync.Mutex   // 全局认证互斥锁
-	lastAuthTime time.Time    // 上次认证完成时间
+	authMu       sync.Mutex // 全局认证互斥锁
+	lastAuthTime time.Time  // 上次认证完成时间
 
-	saveMu sync.Mutex       // 串行化配置文件写入，避免并发 Save 丢更新
-	wg     sync.WaitGroup   // 跟踪所有 client goroutine，用于优雅退出时等待 term 发送
+	saveMu sync.Mutex     // 串行化配置文件写入，避免并发 Save 丢更新
+	wg     sync.WaitGroup // 跟踪所有 client goroutine，用于优雅退出时等待 term 发送
 }
 
 // NewManager 创建管理器实例
@@ -891,10 +891,12 @@ func (m *Manager) sendTermFromSession(sd *SessionData, name string) bool {
 	// 会话绑定了网卡时按原配置重建传输层：多 WAN 下 term 报文必须从
 	// 认证时的出接口发出才能到达对应 AC；重建失败则退回默认路由（旧行为）
 	httpClient := &http.Client{
+		Timeout: authRequestTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+	defer httpClient.CloseIdleConnections()
 	if sd.BindInterface != "" && sd.BindInterface != "sys_default" {
 		if tr, terr := NewHttpTransport(&Config{
 			BindInterface: sd.BindInterface,
@@ -907,7 +909,7 @@ func (m *Manager) sendTermFromSession(sd *SessionData, name string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	tmpClient := &Client{
-		Config: &Config{},
+		Config:     &Config{},
 		HttpClient: httpClient,
 		Ctx:        ctx,
 		Cancel:     cancel,
